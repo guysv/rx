@@ -629,6 +629,15 @@ impl CommandLine {
         }
     }
 
+    pub fn delete_to_start(&mut self) {
+        // Don't allow deleting the ':' prefix
+        if self.cursor > 1 {
+            self.input.drain(1..self.cursor);
+            self.cursor = 1;
+            self.autocomplete.invalidate();
+        }
+    }
+
     pub fn clear(&mut self) {
         self.cursor = 0;
         self.input.clear();

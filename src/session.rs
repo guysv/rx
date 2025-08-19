@@ -2102,6 +2102,22 @@ impl Session {
                 }
                 Mode::Command => {
                     if state == InputState::Pressed {
+                        // Handle Ctrl+U for delete to start of line (works on all platforms)
+                        if key == platform::Key::U && modifiers.ctrl {
+                            self.cmdline.delete_to_start();
+                            return;
+                        }
+                        // Handle Ctrl+A to go to start of line
+                        if key == platform::Key::A && modifiers.ctrl {
+                            self.cmdline.cursor_back();
+                            return;
+                        }
+                        // Handle Ctrl+E to go to end of line
+                        if key == platform::Key::E && modifiers.ctrl {
+                            self.cmdline.cursor_front();
+                            return;
+                        }
+                        
                         match key {
                             platform::Key::Up => {
                                 self.cmdline.history_prev();
