@@ -84,14 +84,14 @@ struct CursorUniforms {
 }
 
 /// Render texture (like a framebuffer). Used for both render targets and source textures (font, cursors, etc.).
-struct RenderTexture {
+struct Texture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     size: [u32; 2],
     format: wgpu::TextureFormat,
 }
 
-impl RenderTexture {
+impl Texture {
     fn new(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
         let size = wgpu::Extent3d {
             width,
@@ -300,14 +300,14 @@ impl RenderTexture {
 
 /// Per-layer data for a view.
 struct LayerData {
-    texture: RenderTexture,
+    texture: Texture,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
 }
 
 impl LayerData {
     fn new(device: &wgpu::Device, w: u32, h: u32, pixels: Option<&[Rgba8]>, queue: &wgpu::Queue) -> Self {
-        let texture = RenderTexture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let texture = Texture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
 
         // Create a quad vertex buffer for rendering this layer
         let batch = sprite2d::Batch::singleton(
@@ -394,7 +394,7 @@ impl LayerData {
 /// Per-view rendering data.
 struct ViewData {
     layer: LayerData,
-    staging_texture: RenderTexture,
+    staging_texture: Texture,
     anim_vertex_buffer: Option<wgpu::Buffer>,
     anim_vertex_count: u32,
     layer_vertex_buffer: Option<wgpu::Buffer>,
@@ -403,7 +403,7 @@ struct ViewData {
 
 impl ViewData {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, pixels: Option<&[Rgba8]>) -> Self {
-        let staging_texture = RenderTexture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let staging_texture = Texture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
         let layer = LayerData::new(device, w, h, pixels, queue);
 
         Self {
@@ -434,17 +434,17 @@ pub struct Renderer {
     blending: Blending,
 
     // Render textures
-    screen_texture: RenderTexture,
+    screen_texture: Texture,
 
     // Batches
     staging_batch: shape2d::Batch,
     final_batch: shape2d::Batch,
 
     // Textures
-    font: RenderTexture,
-    cursors: RenderTexture,
-    checker: RenderTexture,
-    paste: RenderTexture,
+    font: Texture,
+    cursors: Texture,
+    checker: Texture,
+    paste: Texture,
 
     // Sampler
     sampler: wgpu::Sampler,
@@ -618,13 +618,13 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         let (paste_w, paste_h) = (8, 8);
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let font = RenderTexture::new_with_data(&device, &queue, font_w, font_h, format, Some(&font_img));
-        let cursors = RenderTexture::new_with_data(&device, &queue, cursors_w, cursors_h, format, Some(&cursors_img));
-        let checker = RenderTexture::new_with_data(&device, &queue, checker_w, checker_h, format, Some(&draw::CHECKER));
-        let paste = RenderTexture::new_with_data(&device, &queue, paste_w, paste_h, format, None);
+        let font = Texture::new_with_data(&device, &queue, font_w, font_h, format, Some(&font_img));
+        let cursors = Texture::new_with_data(&device, &queue, cursors_w, cursors_h, format, Some(&cursors_img));
+        let checker = Texture::new_with_data(&device, &queue, checker_w, checker_h, format, Some(&draw::CHECKER));
+        let paste = Texture::new_with_data(&device, &queue, paste_w, paste_h, format, None);
 
         // Create screen render target
-        let screen_texture = RenderTexture::new(
+        let screen_texture = Texture::new(
             &device,
             win_size.width as u32,
             win_size.height as u32,
