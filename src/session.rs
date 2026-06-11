@@ -2131,7 +2131,6 @@ impl Session {
                         self.switch_mode(Mode::Normal);
                         return;
                     }
-
                 }
             }
 
