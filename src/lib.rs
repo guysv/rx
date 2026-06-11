@@ -30,7 +30,6 @@ mod event;
 mod flood;
 mod font;
 mod history;
-mod wgpu;
 mod image;
 mod io;
 mod palette;
@@ -41,6 +40,7 @@ mod renderer;
 mod sprite;
 mod timer;
 mod view;
+mod wgpu;
 
 #[macro_use]
 pub mod util;
