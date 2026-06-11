@@ -83,91 +83,12 @@ struct CursorUniforms {
     _padding: [f32; 7],   // 28 bytes to reach 96 total (WGSL alignment)
 }
 
-/// Bundle of texture, view, and sampler for a texture resource.
-struct TextureBundle {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    size: [u32; 2],
-}
-
-impl TextureBundle {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, data: Option<&[u8]>) -> Self {
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        if let Some(data) = data {
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                size,
-            );
-        }
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        Self {
-            texture,
-            view,
-            size: [width, height],
-        }
-    }
-
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        self.texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("texture"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        self.view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.size = [width, height];
-    }
-}
-
-/// Render texture (like a framebuffer).
+/// Render texture (like a framebuffer). Used for both render targets and source textures (font, cursors, etc.).
 struct RenderTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     size: [u32; 2],
+    format: wgpu::TextureFormat,
 }
 
 impl RenderTexture {
@@ -198,11 +119,51 @@ impl RenderTexture {
             texture,
             view,
             size: [width, height],
+            format,
         }
+    }
+
+    /// Create a texture with optional initial pixel data (e.g. font atlas, cursors, checker).
+    fn new_with_data(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        data: Option<&[u8]>,
+    ) -> Self {
+        let tex = Self::new(device, width, height, format);
+        if let Some(data) = data {
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &tex.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        tex
     }
 
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) {
         *self = Self::new(device, width, height, format);
+    }
+
+    /// Resize keeping current format (e.g. for paste texture).
+    fn resize_same_format(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        self.resize(device, width, height, self.format);
     }
 
     #[allow(dead_code)]
@@ -480,10 +441,10 @@ pub struct Renderer {
     final_batch: shape2d::Batch,
 
     // Textures
-    font: TextureBundle,
-    cursors: TextureBundle,
-    checker: TextureBundle,
-    paste: TextureBundle,
+    font: RenderTexture,
+    cursors: RenderTexture,
+    checker: RenderTexture,
+    paste: RenderTexture,
 
     // Sampler
     sampler: wgpu::Sampler,
@@ -656,10 +617,11 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         let (checker_w, checker_h) = (2, 2);
         let (paste_w, paste_h) = (8, 8);
 
-        let font = TextureBundle::new(&device, &queue, font_w, font_h, Some(&font_img));
-        let cursors = TextureBundle::new(&device, &queue, cursors_w, cursors_h, Some(&cursors_img));
-        let checker = TextureBundle::new(&device, &queue, checker_w, checker_h, Some(&draw::CHECKER));
-        let paste = TextureBundle::new(&device, &queue, paste_w, paste_h, None);
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let font = RenderTexture::new_with_data(&device, &queue, font_w, font_h, format, Some(&font_img));
+        let cursors = RenderTexture::new_with_data(&device, &queue, cursors_w, cursors_h, format, Some(&cursors_img));
+        let checker = RenderTexture::new_with_data(&device, &queue, checker_w, checker_h, format, Some(&draw::CHECKER));
+        let paste = RenderTexture::new_with_data(&device, &queue, paste_w, paste_h, format, None);
 
         // Create screen render target
         let screen_texture = RenderTexture::new(
@@ -2008,7 +1970,7 @@ impl Renderer {
                         // Resize paste texture if needed
                         let [paste_w, paste_h] = self.paste.size;
                         if paste_w != w || paste_h != h {
-                            self.paste.resize(&self.device, w, h);
+                            self.paste.resize_same_format(&self.device, w, h);
                         }
 
                         // Upload to paste texture
@@ -2064,7 +2026,7 @@ impl Renderer {
                         // Resize paste texture if needed
                         let [paste_w, paste_h] = self.paste.size;
                         if paste_w != w || paste_h != h {
-                            self.paste.resize(&self.device, w, h);
+                            self.paste.resize_same_format(&self.device, w, h);
                         }
 
                         // Upload to paste texture
