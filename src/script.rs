@@ -117,12 +117,16 @@ impl Gfx {
                 },
             ],
         });
+        // Textures are visible to vertex shaders too: point-scatter
+        // pipelines position vertices by `textureLoad`ing their input.
+        // One layout shared by all render pipelines keeps every texture
+        // bind group compatible with every pipeline by construction.
         let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("script_texture_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX.union(wgpu::ShaderStages::FRAGMENT),
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -132,7 +136,7 @@ impl Gfx {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX.union(wgpu::ShaderStages::FRAGMENT),
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
@@ -1651,6 +1655,33 @@ impl Ctx {
         fs: &str,
         textures: i64,
     ) -> Option<ScriptPipeline> {
+        self.build_render_pipeline(shader, vs, fs, textures, false)
+    }
+
+    /// Create a point-list render pipeline: one point per vertex, no
+    /// vertex buffers — the vertex shader positions each point from
+    /// `@builtin(vertex_index)`, typically by `textureLoad`ing a bound
+    /// texture (scatter passes). Bind groups are laid out exactly like
+    /// `create_render_pipeline`, so the same bind groups serve both.
+    #[rune::function]
+    fn create_point_pipeline(
+        &mut self,
+        shader: &ScriptShader,
+        vs: &str,
+        fs: &str,
+        textures: i64,
+    ) -> Option<ScriptPipeline> {
+        self.build_render_pipeline(shader, vs, fs, textures, true)
+    }
+
+    fn build_render_pipeline(
+        &mut self,
+        shader: &ScriptShader,
+        vs: &str,
+        fs: &str,
+        textures: i64,
+        points: bool,
+    ) -> Option<ScriptPipeline> {
         let Some(gfx) = self.gfx() else {
             self.error("the GPU is not available in this context");
             return None;
@@ -1676,6 +1707,32 @@ impl Ctx {
                 bind_group_layouts: &layouts,
                 push_constant_ranges: &[],
             });
+        let sprite_layout = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ScriptVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 20,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Unorm8x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
+            ],
+        }];
         let pipeline = gfx
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1684,32 +1741,7 @@ impl Ctx {
                 vertex: wgpu::VertexState {
                     module: &shader.module,
                     entry_point: Some(vs),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ScriptVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                offset: 0,
-                                shader_location: 0,
-                                format: wgpu::VertexFormat::Float32x3,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 12,
-                                shader_location: 1,
-                                format: wgpu::VertexFormat::Float32x2,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 20,
-                                shader_location: 2,
-                                format: wgpu::VertexFormat::Unorm8x4,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 24,
-                                shader_location: 3,
-                                format: wgpu::VertexFormat::Float32,
-                            },
-                        ],
-                    }],
+                    buffers: if points { &[] } else { &sprite_layout },
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1717,13 +1749,19 @@ impl Ctx {
                     entry_point: Some(fs),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: SCRIPT_TEXTURE_FORMAT,
+                        // Alpha blending degenerates to replace at
+                        // alpha 1, which is what scatters write.
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    topology: if points {
+                        wgpu::PrimitiveTopology::PointList
+                    } else {
+                        wgpu::PrimitiveTopology::TriangleList
+                    },
                     ..Default::default()
                 },
                 depth_stencil: None,
@@ -2334,6 +2372,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::read_file)?;
     m.function_meta(Ctx::create_shader)?;
     m.function_meta(Ctx::create_render_pipeline)?;
+    m.function_meta(Ctx::create_point_pipeline)?;
     m.function_meta(Ctx::create_transform_bind_group)?;
     m.function_meta(Ctx::create_transform_params_bind_group)?;
     m.function_meta(Ctx::create_texture_bind_group)?;
@@ -4460,6 +4499,143 @@ mod test {
         let pixels = target.pixels(&gfx.device);
         for px in pixels.chunks(4) {
             assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
+        }
+    }
+
+    /// A vertex_index-driven point scatter (the lookupmap mechanism):
+    /// each vertex loads one source texel, decodes its color to a map
+    /// position, and emits a point there — or clip-rejects if the
+    /// texel is transparent. No vertex buffers are bound.
+    const SCATTER_WGSL: &str = r#"
+        @group(1) @binding(0) var src: texture_2d<f32>;
+
+        struct VertexOutput {
+            @builtin(position) position: vec4<f32>,
+            @location(0) color: vec4<f32>,
+        };
+
+        fn srgb_encode(c: f32) -> f32 {
+            if (c <= 0.0031308) {
+                return c * 12.92;
+            }
+            return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+        }
+
+        @vertex
+        fn vs_scatter(@builtin(vertex_index) index: u32) -> VertexOutput {
+            let dims = textureDimensions(src);
+            let texel = textureLoad(
+                src, vec2<u32>(index % dims.x, index / dims.x), 0);
+            var out: VertexOutput;
+            out.color = texel;
+            if (texel.a == 0.0) {
+                // Clip-space rejection: transparent pixels land nowhere.
+                out.position = vec4<f32>(-2.0, -2.0, 0.0, 1.0);
+                return out;
+            }
+            // Decode the key: (r, g) bytes are the map position.
+            // The map is 8x8; point centers in NDC, v as the row.
+            let u = round(srgb_encode(texel.r) * 255.0);
+            let v = round(srgb_encode(texel.g) * 255.0);
+            out.position = vec4<f32>(
+                (u + 0.5) / 4.0 - 1.0,
+                1.0 - (v + 0.5) / 4.0,
+                0.0,
+                1.0,
+            );
+            return out;
+        }
+
+        @fragment
+        fn fs_scatter(in: VertexOutput) -> @location(0) vec4<f32> {
+            return in.color;
+        }
+    "#;
+
+    #[test]
+    fn point_pipeline_scatters_by_vertex_index() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scatter.wgsl"), SCATTER_WGSL).unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            fn keys() {
+                let data = Bytes::new();
+                // (0,0): key color (3,5) -> map (3,5)
+                data.push(3); data.push(5); data.push(0); data.push(255);
+                // (1,0): transparent -> clip-rejected, lands nowhere
+                data.push(0); data.push(0); data.push(0); data.push(0);
+                // (0,1): key (7,0) -> map (7,0)
+                data.push(7); data.push(0); data.push(0); data.push(255);
+                // (1,1): key (0,2) -> map (0,2)
+                data.push(0); data.push(2); data.push(0); data.push(255);
+                data
+            }
+            pub fn init(rx) {
+                let wgsl = rx.read_file("scatter.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                let pipeline = rx.create_point_pipeline(shader, "vs_scatter", "fs_scatter", 1).unwrap();
+                let src = rx.create_texture(2, 2).unwrap();
+                src.upload(keys());
+                let map = rx.create_texture(8, 8).unwrap();
+                let tbg = rx.create_transform_bind_group(8, 8, rx::mat4_identity()).unwrap();
+                let sbg = rx.create_texture_bind_group(src).unwrap();
+                #{ pipeline, map, tbg, sbg }
+            }
+            pub fn shade(state, rx, encoder) {
+                let pass = encoder.begin_render_pass("scatter", state.map, "clear").unwrap();
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_bind_group(1, state.sbg).unwrap();
+                pass.draw(4, 1).unwrap();
+                pass.end();
+            }
+            pub fn map(state) { state.map }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().count(),
+            1,
+            "fixture plugin must load: {}",
+            session.message
+        );
+
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive the shade dispatch: {}",
+            session.message
+        );
+
+        let plugin = host.plugins().next().unwrap();
+        let map = plugin.script.call("map", (plugin.state.clone(),)).unwrap();
+        let map = map.borrow_ref::<ScriptTexture>().unwrap();
+        let pixels = map.pixels(&gfx.device);
+
+        let at = |x: usize, y: usize| &pixels[(y * 8 + x) * 4..][..4];
+        let landed = [(3, 5), (7, 0), (0, 2)];
+        assert_eq!(at(3, 5), &[3, 5, 0, 255], "key (3,5)");
+        assert_eq!(at(7, 0), &[7, 0, 0, 255], "key (7,0)");
+        assert_eq!(at(0, 2), &[0, 2, 0, 255], "key (0,2)");
+        for y in 0..8 {
+            for x in 0..8 {
+                if !landed.contains(&(x, y)) {
+                    assert_eq!(at(x, y), &[0, 0, 0, 0], "({}, {}) must be empty", x, y);
+                }
+            }
         }
     }
 
