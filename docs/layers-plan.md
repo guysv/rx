@@ -43,6 +43,53 @@ migration proof — with `nlayers = 1` every offset is zero and every quad
 count collapses to today's, so **no existing digest may change in any
 phase**.
 
+## Status: P35–P38 complete; P39 deferred
+
+P35–P38 landed, one commit each on `layers` (replays:
+`tests/layers`, `tests/layers-active`, `tests/layers-attrs`).
+Findings and deviations, in phase order:
+
+- **P35**: as planned — zero digest churn; the audit's only compiler
+  catch was `brush::expand`'s extent destructuring (display-space by
+  design).
+- **P36**: the final-pass projection is effectively **y-up** despite
+  the `TopLeft` ortho origin: display shapes land in the *bottom*
+  strip with no transform at all, and the planned "translate down by
+  a strip" moved strokes *up* a strip (caught frame-by-frame via
+  `RX_DUMP_FRAMES` before recording — the digest would have locked
+  the bug in). `ViewOp::Blit` dst rects and `SetPixel` rows turned
+  out to be raw GPU offsets that only worked at single-strip heights;
+  they now convert y-up sheet coords explicitly, which also fixed
+  `f/clone` content placement on layered sheets. The staging texture
+  needed its own display-sized quad (it shared the layer quad).
+- **P37**: routing moved entirely **renderer-side**, not the planned
+  session-emission choke point: the final-pass transform routes all
+  GPU writes (brush, fills, erases, paste stamps) and the renderer op
+  arms translate the CPU reads (yank/flip/SetPixel) — one subsystem
+  owns the conversion, and `Effect` payloads stay display-space.
+  `v/clear` became a byte-exact strip upload (a load-op clear can't
+  be scissored), which exposed an sRGB rounding artifact in the old
+  pass-clear — the `flood` digest re-recorded over a ±1-byte fill
+  difference. Flood fill slices the active strip from the snapshot
+  (seed, bounds, and output all display-space). Replay-flow finding:
+  `selection/paste` only fires in visual-*pasting* state, so
+  cross-layer paste switches layers inside visual mode.
+- **P38**: merge/flatten/reorder are CPU sheet rewrites **recorded
+  directly into the resource** (`record_view_*` + `damaged`) — the
+  undo-restore path reused for forward edits. Single-undo-step
+  merge/flatten fell out with zero new ViewOps, simpler than the
+  planned renderer ops. Attrs re-bake into the strip vertex buffer
+  only on change; hidden strips stay as zero-opacity quads so the
+  staging z-split never shifts. Test-authoring finding: mode-specific
+  default bindings (`h`/`l` = frames) beat General-tier `map`s — test
+  keys must dodge them.
+- **P39 (script tier): deferred, out of scope** — to be designed when
+  real plugins want layered views, not speculatively. Current
+  de-facto semantics, documented here until then: `view_pixels` and
+  `clear_view_rect` stay display-space (bottom-strip reads / routed
+  writes respectively), `begin_view_pass`/`view_bind_group` see the
+  single-layer views only (the degeneracy the suite proves).
+
 ## The design, in five mechanisms
 
 Verified against the current code; references are the load-bearing sites.
