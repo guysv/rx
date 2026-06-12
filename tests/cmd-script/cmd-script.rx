@@ -1,0 +1,9 @@
+-- Exercises P11: plugin-registered commands typed in the command line.
+-- The message line stays on: command output is the digest-visible state.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on

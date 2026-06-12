@@ -115,6 +115,11 @@ fn mode_vis() {
 }
 
 #[test]
+fn cmd_script() {
+    test("cmd-script");
+}
+
+#[test]
 fn source() {
     test("source");
 }

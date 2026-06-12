@@ -1,0 +1,23 @@
+00000 0000010 cursor/moved 639 359
+00010 0000100 char/received ':'
+00020 0000200 char/received 'g'
+00030 0000300 char/received 'r'
+00040 0000400 char/received 'e'
+00050 0000500 char/received 'e'
+00060 0000600 char/received 't'
+00070 0000700 char/received ' '
+00080 0000800 char/received 'r'
+00090 0000900 char/received 'u'
+00100 0001000 char/received 'n'
+00110 0001100 char/received 'e'
+00120 0001200 keyboard/input <return> pressed
+00125 0001250 keyboard/input <return> released
+00160 0001600 char/received ':'
+00170 0001700 char/received 'g'
+00180 0001800 char/received 'r'
+00190 0001900 char/received 'e'
+00200 0002000 char/received 'e'
+00210 0002100 char/received 't'
+00220 0002200 keyboard/input <return> pressed
+00225 0002250 keyboard/input <return> released
+00260 0002600 cursor/moved 640 360

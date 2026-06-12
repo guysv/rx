@@ -122,6 +122,12 @@ pub enum Command {
     ViewNext,
     ViewPrev,
 
+    /// A plugin-registered command: name and raw (unparsed) arguments.
+    /// Argument parsing is late-bound: it happens at dispatch, against the
+    /// signature the plugin declared, so commands can be parsed (and bound
+    /// to keys) before the owning plugin is loaded.
+    Script(String, String),
+
     Noop,
 }
 
@@ -233,6 +239,7 @@ impl fmt::Display for Command {
             Self::SelectionFlip(Axis::Horizontal) => write!(f, "Flip selection horizontally"),
             Self::SelectionFlip(Axis::Vertical) => write!(f, "Flip selection vertically"),
             Self::PaintColor(_, x, y) => write!(f, "Paint {:2},{:2}", x, y),
+            Self::Script(name, _) => write!(f, "Script command: {}", name),
             _ => write!(f, "..."),
         }
     }
@@ -286,6 +293,8 @@ impl From<Command> for String {
             Command::Zoom(Op::Incr) => format!("v/zoom +"),
             Command::Zoom(Op::Decr) => format!("v/zoom -"),
             Command::Zoom(Op::Set(z)) => format!("v/zoom {}", z),
+            Command::Script(name, args) if args.is_empty() => name,
+            Command::Script(name, args) => format!("{} {}", name, args),
             _ => unimplemented!(),
         }
     }
@@ -523,6 +532,11 @@ impl CommandLine {
         self.autocomplete = Autocomplete::new(CommandCompleter::new(path, exts.as_slice()));
     }
 
+    /// Replace the list of plugin-registered commands shown in help.
+    pub fn set_script_commands(&mut self, cmds: Vec<(String, String)>) {
+        self.commands.set_script_commands(cmds);
+    }
+
     pub fn parse(&self, input: &str) -> Result<Command, Error> {
         match self.parser.parse(input) {
             Ok((cmd, _)) => Ok(cmd),
@@ -667,6 +681,10 @@ impl CommandLine {
 
 pub struct Commands {
     commands: Vec<(&'static str, &'static str, Parser<Command>)>,
+    /// Plugin-registered commands, as `(name, help)`. Kept here so help
+    /// listings can show them next to the builtins; dispatch goes through
+    /// the script registry, not this list.
+    script_commands: Vec<(String, String)>,
 }
 
 impl Commands {
@@ -677,7 +695,16 @@ impl Commands {
                 "Add color to palette",
                 color().map(Command::PaletteAdd),
             )],
+            script_commands: Vec::new(),
         }
+    }
+
+    pub fn set_script_commands(&mut self, cmds: Vec<(String, String)>) {
+        self.script_commands = cmds;
+    }
+
+    pub fn script_commands(&self) -> &[(String, String)] {
+        &self.script_commands
     }
 
     pub fn parser(&self) -> Parser<Command> {
@@ -687,13 +714,26 @@ impl Commands {
         let commands = self.commands.iter().map(|(_, _, v)| v.clone());
         let choices = commands.chain(iter::once(noop)).collect();
 
+        // Any command name that doesn't match a builtin is a script
+        // command; its arguments stay unparsed until dispatch. Builtins
+        // that match but fail on their arguments commit to their own
+        // error (`or` only falls through when nothing was consumed).
+        let script_fallback: Parser<Command> = Parser::new(
+            |input: &str| {
+                let (name, rest) = match input.find(char::is_whitespace) {
+                    Some(i) => (&input[..i], input[i..].trim_start()),
+                    None => (input, ""),
+                };
+                if name.is_empty() {
+                    return Err(("expected <command>".into(), input));
+                }
+                Ok((Command::Script(name.to_string(), rest.to_string()), ""))
+            },
+            "<script-cmd>",
+        );
+
         symbol(':')
-            .then(
-                choice(choices).or(peek(
-                    until(hush(whitespace()).or(end()))
-                        .try_map(|cmd| Err(format!("unknown command: {}", cmd))),
-                )),
-            )
+            .then(choice(choices).or(script_fallback))
             .map(|(_, cmd)| cmd)
     }
 
@@ -1414,13 +1454,26 @@ mod test {
     }
 
     #[test]
-    fn test_unknown_command() {
+    fn test_unknown_command_is_script_command() {
         let p = Commands::default().line_parser();
 
-        let (err, rest) = p.parse(":fnord").unwrap_err();
-        assert_eq!(rest, "fnord");
-        assert_eq!(err.to_string(), "unknown command: fnord");
+        // Unknown names parse as script commands; resolution happens at
+        // dispatch, against the plugin command registry.
+        assert_eq!(
+            p.parse(":fnord").unwrap(),
+            (Command::Script("fnord".to_owned(), "".to_owned()), "")
+        );
+        assert_eq!(
+            p.parse(":my/cmd 1 #ff0000  x").unwrap(),
+            (
+                Command::Script("my/cmd".to_owned(), "1 #ff0000  x".to_owned()),
+                ""
+            )
+        );
 
+        // A builtin that matches by name but fails on its arguments
+        // commits to its own error; it must not fall through to the
+        // script fallback.
         let (err, rest) = p.parse(":mode fnord").unwrap_err();
         assert_eq!(rest, "fnord");
         assert_eq!(err.to_string(), "unknown mode: fnord");

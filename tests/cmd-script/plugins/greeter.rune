@@ -1,0 +1,10 @@
+// Fixture plugin: registers a typed command. The replay types
+// `:greet rune` (message visible) and `:greet` (usage error visible).
+pub fn init(rx) {
+    rx.register_command("greet", ["str"], "Greet someone", greet);
+    #{}
+}
+
+pub fn greet(state, rx, args) {
+    rx.message(`hello ${args[0]}`);
+}
