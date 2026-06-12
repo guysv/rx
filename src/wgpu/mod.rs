@@ -342,6 +342,26 @@ fn sprite_vertex_buffer(
     (vertex_buffer, verts.len() as u32)
 }
 
+/// One quad per layer strip, all mapped onto the display footprint,
+/// with per-strip opacity. The bottom layer comes first so upper layers
+/// alpha-blend over it. Batch src rects are y-down texture coordinates:
+/// strip n (y-up) covers rows `sheet_h - (n+1)*h .. sheet_h - n*h`.
+fn strip_batch(w: u32, h: u32, sheet_h: u32, alphas: &[f32]) -> sprite2d::Batch {
+    let mut batch = sprite2d::Batch::new(w, sheet_h);
+    for (n, alpha) in alphas.iter().enumerate() {
+        let y2 = (sheet_h - n as u32 * h) as f32;
+        batch.add(
+            Rect::new(0., y2 - h as f32, w as f32, y2),
+            Rect::origin(w as f32, h as f32),
+            ZDepth::default(),
+            Rgba::TRANSPARENT,
+            *alpha,
+            Repeat::default(),
+        );
+    }
+    batch
+}
+
 impl LayerData {
     /// `h` is the display (strip) height; `sheet_h` is the texture
     /// height, one strip per layer.
@@ -358,24 +378,7 @@ impl LayerData {
         debug_assert!(sheet_h % h == 0, "the sheet is a whole number of strips");
         let nlayers = (sheet_h / h) as usize;
 
-        // One quad per layer strip, all mapped onto the display
-        // footprint. The bottom layer comes first so upper layers
-        // alpha-blend over it. Batch src rects are y-down texture
-        // coordinates: strip n (y-up) covers rows
-        // `sheet_h - (n+1)*h .. sheet_h - n*h`.
-        let mut batch = sprite2d::Batch::new(w, sheet_h);
-        for n in 0..nlayers {
-            let y2 = (sheet_h - n as u32 * h) as f32;
-            batch.add(
-                Rect::new(0., y2 - h as f32, w as f32, y2),
-                Rect::origin(w as f32, h as f32),
-                ZDepth::default(),
-                Rgba::TRANSPARENT,
-                1.,
-                Repeat::default(),
-            );
-        }
-
+        let batch = strip_batch(w, h, sheet_h, &vec![1.; nlayers]);
         let (vertex_buffer, vertex_count) =
             sprite_vertex_buffer(device, queue, &batch, "layer_vertex_buffer");
 
@@ -435,6 +438,9 @@ struct ViewData {
     staging_texture: Texture,
     staging_vertex_buffer: wgpu::Buffer,
     staging_vertex_count: u32,
+    /// The per-strip opacities baked into the layer vertex buffer
+    /// (visibility, opacity, dim — see `update_view_layer_attrs`).
+    strip_alphas: Vec<f32>,
     anim_vertex_buffer: Option<wgpu::Buffer>,
     anim_vertex_count: u32,
     layer_vertex_buffer: Option<wgpu::Buffer>,
@@ -471,11 +477,13 @@ impl ViewData {
         let (staging_vertex_buffer, staging_vertex_count) =
             sprite_vertex_buffer(device, queue, &staging_batch, "staging_vertex_buffer");
 
+        let nlayers = (sheet_h / h) as usize;
         Self {
             layer,
             staging_texture,
             staging_vertex_buffer,
             staging_vertex_count,
+            strip_alphas: vec![1.; nlayers],
             anim_vertex_buffer: None,
             anim_vertex_count: 0,
             layer_vertex_buffer: None,
@@ -1247,6 +1255,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
 
         self.update_view_animations(session);
         self.update_view_composites(session);
+        self.update_view_layer_attrs(session);
 
         // Get surface texture (surface-less mode renders to `screen_texture` only)
         let output = match &self.surface {
@@ -2413,6 +2422,50 @@ impl Renderer {
 
         self.view_data.insert(view.id, view_data);
         Ok(())
+    }
+
+    /// Re-bake layer presentation attributes (visibility, opacity, and
+    /// the `layers/dim` factor on inactive layers) into each view's
+    /// strip vertex buffer, when they changed. Hidden strips stay in
+    /// the buffer at opacity zero, so the vertex count — and the
+    /// staging z-order split — never shifts.
+    fn update_view_layer_attrs(&mut self, session: &Session) {
+        let dim = session.settings["layers/dim"].to_f64() as f32;
+
+        for (id, vd) in self.view_data.iter_mut() {
+            if let Some(view) = session.views.get(*id) {
+                let alphas: Vec<f32> = view
+                    .layer_attrs
+                    .iter()
+                    .enumerate()
+                    .map(|(n, a)| match (a.visible, n == view.active_layer) {
+                        (false, _) => 0.,
+                        (true, true) => a.opacity,
+                        (true, false) => a.opacity * dim,
+                    })
+                    .collect();
+
+                if alphas != vd.strip_alphas
+                    && alphas.len() * 6 == vd.layer.vertex_count as usize
+                {
+                    let [w, sheet_h] = vd.layer.texture.size;
+                    let batch = strip_batch(w, view.fh, sheet_h, &alphas);
+                    let verts: Vec<Sprite2dVertex> = batch
+                        .vertices()
+                        .iter()
+                        .map(|v| Sprite2dVertex {
+                            position: [v.position.x, v.position.y, v.position.z],
+                            uv: [v.uv.x, v.uv.y],
+                            color: [v.color.r, v.color.g, v.color.b, v.color.a],
+                            opacity: v.opacity,
+                        })
+                        .collect();
+                    self.queue
+                        .write_buffer(&vd.layer.vertex_buffer, 0, bytemuck::cast_slice(&verts));
+                    vd.strip_alphas = alphas;
+                }
+            }
+        }
     }
 
     fn update_view_animations(&mut self, session: &Session) {

@@ -48,6 +48,107 @@ pub type ViewCoords<T> = Point<ViewExtent, T>;
 /// Maximum view sheet dimension, set by the GPU texture size limit.
 pub const MAX_SHEET_DIM: u32 = 8192;
 
+/// Presentation attributes of a single layer. These are view state, not
+/// document state: they aren't recorded in the edit history (like zoom
+/// or pan), and merge/flatten *bake* them into pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerAttrs {
+    /// Whether the layer composites at all.
+    pub visible: bool,
+    /// Compositing opacity, `0.0..=1.0`.
+    pub opacity: f32,
+}
+
+impl Default for LayerAttrs {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            opacity: 1.,
+        }
+    }
+}
+
+/// Source-over blend of `top` (scaled by `opacity`) onto `bottom`.
+fn over(top: Rgba8, opacity: f32, bottom: Rgba8) -> Rgba8 {
+    let at = top.a as f32 / 255. * opacity;
+    let ab = bottom.a as f32 / 255.;
+    let a = at + ab * (1. - at);
+
+    if a <= 0. {
+        return Rgba8::TRANSPARENT;
+    }
+    let ch = |t: u8, b: u8| ((t as f32 * at + b as f32 * ab * (1. - at)) / a).round() as u8;
+
+    Rgba8 {
+        r: ch(top.r, bottom.r),
+        g: ch(top.g, bottom.g),
+        b: ch(top.b, bottom.b),
+        a: (a * 255.).round() as u8,
+    }
+}
+
+/// The byte-row index range of layer `n`'s strip within a sheet pixel
+/// buffer. Byte row 0 is the sheet top, so layer n sits
+/// `nlayers - 1 - n` strips down.
+fn strip_range(extent: ViewExtent, n: usize) -> std::ops::Range<usize> {
+    let w = extent.width() as usize;
+    let rows = extent.fh as usize;
+    let start = (extent.nlayers - 1 - n) * rows * w;
+
+    start..start + rows * w
+}
+
+/// A sheet buffer with layer strip `n` composited onto the strip below
+/// it (baking `opacity`) and removed: the merge-down result, one layer
+/// shorter.
+pub fn merge_down(
+    pixels: &[Rgba8],
+    extent: ViewExtent,
+    n: usize,
+    opacity: f32,
+) -> Vec<Rgba8> {
+    debug_assert!(n > 0 && n < extent.nlayers, "strip below must exist");
+
+    let mut out = pixels.to_vec();
+    let top = strip_range(extent, n);
+    let below = strip_range(extent, n - 1);
+
+    for (i, b) in below.clone().enumerate() {
+        out[b] = over(pixels[top.start + i], opacity, pixels[b]);
+    }
+    out.drain(top);
+    out
+}
+
+/// A sheet buffer with layer strips `a` and `b` exchanged.
+pub fn swap_layers(pixels: &[Rgba8], extent: ViewExtent, a: usize, b: usize) -> Vec<Rgba8> {
+    let mut out = pixels.to_vec();
+    let (ra, rb) = (strip_range(extent, a), strip_range(extent, b));
+
+    out[ra.clone()].copy_from_slice(&pixels[rb.clone()]);
+    out[rb].copy_from_slice(&pixels[ra]);
+    out
+}
+
+/// A single-layer sheet: all visible strips composited bottom-up with
+/// their attributes baked in.
+pub fn flatten(pixels: &[Rgba8], extent: ViewExtent, attrs: &[LayerAttrs]) -> Vec<Rgba8> {
+    let strip_len = extent.width() as usize * extent.fh as usize;
+    let mut out = vec![Rgba8::TRANSPARENT; strip_len];
+
+    for n in 0..extent.nlayers {
+        let LayerAttrs { visible, opacity } = attrs[n];
+        if !visible {
+            continue;
+        }
+        let strip = strip_range(extent, n);
+        for i in 0..strip_len {
+            out[i] = over(pixels[strip.start + i], opacity, out[i]);
+        }
+    }
+    out
+}
+
 /// View extent information.
 ///
 /// The extent describes the view *sheet*: frames are horizontal strips
@@ -167,6 +268,8 @@ pub struct View<R> {
     pub nlayers: usize,
     /// The active layer: the strip that writes route to.
     pub active_layer: usize,
+    /// Per-layer presentation attributes; always `nlayers` long.
+    pub layer_attrs: Vec<LayerAttrs>,
     /// View offset relative to the session workspace.
     pub offset: Vector2<f32>,
     /// Identifier.
@@ -251,6 +354,7 @@ impl<R> View<R> {
             fh,
             nlayers: 1,
             active_layer: 0,
+            layer_attrs: vec![LayerAttrs::default()],
             offset: Vector2::zero(),
             zoom: 1.,
             ops: Vec::new(),
@@ -341,6 +445,7 @@ impl<R> View<R> {
     /// footprint is unchanged.
     pub fn extend_layer(&mut self) {
         self.nlayers += 1;
+        self.layer_attrs.push(LayerAttrs::default());
         self.resized();
     }
 
@@ -350,6 +455,7 @@ impl<R> View<R> {
         if self.nlayers > 1 {
             self.nlayers -= 1;
             self.active_layer = self.active_layer.min(self.nlayers - 1);
+            self.layer_attrs.truncate(self.nlayers);
             self.resized();
         }
     }
@@ -491,6 +597,15 @@ impl<R> View<R> {
         ViewCoords::new(self.width() as f32 / 2., self.height() as f32 / 2.)
     }
 
+    /// Mark the file as modified without dirtying the view state — for
+    /// edits recorded directly into the resource (merge, flatten,
+    /// reorder), where the frame-end recording must not fire again.
+    pub fn mark_modified(&mut self) {
+        if let FileStatus::Saved(ref f) = self.file_status {
+            self.file_status = FileStatus::Modified(f.clone());
+        }
+    }
+
     /// View has been modified. Called when using the brush on the view,
     /// or resizing the view.
     pub fn touch(&mut self) {
@@ -578,6 +693,10 @@ impl<R> View<R> {
         self.fh = extent.fh;
         self.nlayers = extent.nlayers;
         self.active_layer = self.active_layer.min(extent.nlayers - 1);
+        // Attrs are presentation state: not restored by undo, but kept
+        // in step with the layer count.
+        self.layer_attrs
+            .resize(extent.nlayers, LayerAttrs::default());
 
         let mut frames = Vec::new();
         let origin = Rect::origin(self.fw as f32, self.fh as f32);
@@ -598,6 +717,9 @@ impl View<ViewResource> {
 
         let mut color = None;
         for n in (0..self.nlayers).rev() {
+            if !self.layer_attrs[n].visible {
+                continue;
+            }
             let q = ViewCoords::new(p.x, p.y + n as u32 * self.fh);
             if let Some(c) = snapshot.coord_to_index(q).and_then(|idx| pixels.get(idx)) {
                 if c.a > 0 {
@@ -1034,6 +1156,62 @@ mod tests {
         assert_eq!(v.nlayers, 1);
         v.shrink_layer();
         assert_eq!(v.nlayers, 1);
+        assert_eq!(v.layer_attrs.len(), 1);
+    }
+
+    const R: Rgba8 = Rgba8::RED;
+    const T: Rgba8 = Rgba8::TRANSPARENT;
+
+    #[test]
+    fn test_strip_pixel_math() {
+        // A 2x1 frame, 3 layers: sheet is 2 wide, 3 tall. Byte row 0 is
+        // the *top* layer's strip.
+        let e = ViewExtent::layered(2, 1, 1, 3);
+        let b = Rgba8 {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        #[rustfmt::skip]
+        let sheet = vec![
+            b, T, // layer 2
+            T, R, // layer 1
+            R, R, // layer 0
+        ];
+
+        // Merge layer 2 down onto layer 1: blue wins where opaque.
+        let merged = merge_down(&sheet, e, 2, 1.);
+        assert_eq!(merged, vec![b, R, R, R]);
+
+        // Swap layers 0 and 2.
+        let swapped = swap_layers(&sheet, e, 0, 2);
+        assert_eq!(swapped, vec![R, R, T, R, b, T]);
+
+        // Flatten: top-most opaque pixel wins per column.
+        let flat = flatten(&sheet, e, &[LayerAttrs::default(); 3]);
+        assert_eq!(flat, vec![b, R]);
+
+        // Flatten with the top layer hidden.
+        let attrs = [
+            LayerAttrs::default(),
+            LayerAttrs::default(),
+            LayerAttrs {
+                visible: false,
+                opacity: 1.,
+            },
+        ];
+        assert_eq!(flatten(&sheet, e, &attrs), vec![R, R]);
+
+        // Opacity bakes: a half-opaque red over nothing.
+        let half = merge_down(
+            &vec![R, R, T, T],
+            ViewExtent::layered(2, 1, 1, 2),
+            1,
+            0.5,
+        );
+        assert_eq!(half[0].a, 128);
+        assert_eq!(half[0].r, 255);
     }
 }
 

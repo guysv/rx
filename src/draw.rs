@@ -737,16 +737,22 @@ pub fn draw_view_animation<R>(session: &Session, v: &View<R>) -> sprite2d::Batch
     let dst = Rect::new(-(v.fw as f32), 0., 0., v.fh as f32) * v.zoom + (session.offset + v.offset);
 
     // Composite the current frame's strip from every layer, bottom
-    // first. Batch src rects are y-down texture coordinates: layer n
-    // (y-up) covers rows `sheet_h - (n+1)*fh .. sheet_h - n*fh`.
+    // first, honoring visibility and opacity (but not `layers/dim` —
+    // the preview shows the true composite). Batch src rects are
+    // y-down texture coordinates: layer n (y-up) covers rows
+    // `sheet_h - (n+1)*fh .. sheet_h - n*fh`.
     for n in 0..v.nlayers as u32 {
+        let attrs = v.layer_attrs[n as usize];
+        if !attrs.visible {
+            continue;
+        }
         let y2 = (sheet_h - n * v.fh) as f32;
         batch.add(
             Rect::new(frame.x1, y2 - v.fh as f32, frame.x2, y2),
             dst,
             self::VIEW_LAYER,
             Rgba::TRANSPARENT,
-            1.,
+            attrs.opacity,
             Repeat::default(),
         );
     }

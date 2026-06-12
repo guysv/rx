@@ -625,6 +625,10 @@ impl Default for Settings {
                 "grid/color" => Value::Rgba8(color::BLUE),
                 "grid/spacing" => Value::U32Tuple(8, 8),
 
+                // Composite-time opacity factor for inactive layers
+                // (1.0 = off): the "where will my brush land" affordance.
+                "layers/dim" => Value::F64(1.0),
+
                 "p/height" => Value::U32(Session::PALETTE_HEIGHT),
 
                 "debug/crosshair" => Value::Bool(false),
@@ -1820,6 +1824,25 @@ impl Session {
         None
     }
 
+    /// Set a layer's visibility (`None` = the active layer).
+    fn set_layer_visible(&mut self, n: Option<i32>, visible: bool) {
+        let v = self.active_view_mut();
+        let n = n.map_or(v.active_layer, |n| n as usize);
+        if let Some(attrs) = v.layer_attrs.get_mut(n) {
+            attrs.visible = visible;
+            self.message(
+                format!(
+                    "layer {} {}",
+                    n + 1,
+                    if visible { "shown" } else { "hidden" }
+                ),
+                MessageType::Info,
+            );
+        } else {
+            self.message(format!("Error: no layer {}", n + 1), MessageType::Error);
+        }
+    }
+
     fn undo(&mut self, id: ViewId) {
         self.restore_view_snapshot(id, Direction::Backward);
     }
@@ -2879,6 +2902,124 @@ impl Session {
                         format!("Error: set index must be in the range {}..{}", 0, l - 1),
                         MessageType::Error,
                     );
+                }
+            }
+            Command::LayerHide(n) => {
+                self.set_layer_visible(n, false);
+            }
+            Command::LayerShow(n) => {
+                self.set_layer_visible(n, true);
+            }
+            Command::LayerSolo => {
+                let v = self.active_view_mut();
+                let active = v.active_layer;
+                let others_visible = v
+                    .layer_attrs
+                    .iter()
+                    .enumerate()
+                    .any(|(n, a)| n != active && a.visible);
+
+                for (n, a) in v.layer_attrs.iter_mut().enumerate() {
+                    a.visible = n == active || !others_visible;
+                }
+                let msg = if others_visible { "solo" } else { "all visible" };
+                self.message(format!("layer/solo: {}", msg), MessageType::Info);
+            }
+            Command::LayerOpacity(o, n) => {
+                let v = self.active_view_mut();
+                let n = n.map_or(v.active_layer, |n| n as usize);
+                if let Some(attrs) = v.layer_attrs.get_mut(n) {
+                    attrs.opacity = o.clamp(0., 1.);
+                    let o = attrs.opacity;
+                    self.message(
+                        format!("layer/opacity: layer {} at {}", n + 1, o),
+                        MessageType::Info,
+                    );
+                } else {
+                    self.message(
+                        format!("Error: no layer {}", n as i32 + 1),
+                        MessageType::Error,
+                    );
+                }
+            }
+            Command::LayerUp | Command::LayerDown => {
+                let v = self.active_view();
+                let a = v.active_layer;
+                let b = if cmd == Command::LayerUp {
+                    a + 1
+                } else {
+                    a.wrapping_sub(1)
+                };
+                if b >= v.nlayers {
+                    self.message("layer at the edge already".to_string(), MessageType::Info);
+                } else {
+                    // A physical strip swap, recorded as a paint — the
+                    // sheet stays the document, and the move is undoable.
+                    let extent = v.extent();
+                    let (_, pixels) = v.resource.layer.current_snapshot();
+                    let swapped = view::swap_layers(pixels, extent, a, b);
+
+                    let v = self.active_view_mut();
+                    v.resource.record_view_painted(swapped);
+                    v.layer_attrs.swap(a, b);
+                    v.active_layer = b;
+                    v.mark_modified();
+                    v.damaged(None);
+                    self.message(
+                        format!("layer {} -> {}", a + 1, b + 1),
+                        MessageType::Info,
+                    );
+                }
+            }
+            Command::LayerMerge => {
+                let v = self.active_view();
+                let a = v.active_layer;
+                if a == 0 {
+                    self.message(
+                        "Error: layer/merge: no layer below the active one".to_string(),
+                        MessageType::Error,
+                    );
+                } else {
+                    // One resize-with-pixels edit: composite the active
+                    // strip onto the one below (baking its opacity) and
+                    // drop it. Single undo step by construction.
+                    let extent = v.extent();
+                    let opacity = v.layer_attrs[a].opacity;
+                    let (_, pixels) = v.resource.layer.current_snapshot();
+                    let merged = view::merge_down(pixels, extent, a, opacity);
+                    let new_extent =
+                        ViewExtent::layered(extent.fw, extent.fh, extent.nframes, extent.nlayers - 1);
+
+                    let v = self.active_view_mut();
+                    v.resource.record_view_resized(merged, new_extent);
+                    v.nlayers = new_extent.nlayers;
+                    v.layer_attrs.remove(a);
+                    v.active_layer = a - 1;
+                    v.mark_modified();
+                    v.damaged(Some(new_extent));
+                    let nlayers = new_extent.nlayers;
+                    self.message(format!("layer/merge: {} layers", nlayers), MessageType::Info);
+                }
+            }
+            Command::LayerFlatten => {
+                let v = self.active_view();
+                if v.nlayers > 1 {
+                    // Bake every visible layer (and its attributes) into
+                    // a single strip — one resize-with-pixels edit.
+                    let extent = v.extent();
+                    let (_, pixels) = v.resource.layer.current_snapshot();
+                    let flat = view::flatten(pixels, extent, &v.layer_attrs);
+                    let new_extent =
+                        ViewExtent::layered(extent.fw, extent.fh, extent.nframes, 1);
+
+                    let v = self.active_view_mut();
+                    v.resource.record_view_resized(flat, new_extent);
+                    v.nlayers = 1;
+                    v.layer_attrs = vec![view::LayerAttrs::default()];
+                    v.active_layer = 0;
+                    v.mark_modified();
+                    v.damaged(Some(new_extent));
+                    self.message("layer/flatten: 1 layer".to_string(), MessageType::Info);
                 }
             }
             Command::Slice(None) => {
