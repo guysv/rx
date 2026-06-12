@@ -28,6 +28,12 @@ impl From<ViewId> for u16 {
     }
 }
 
+impl From<u16> for ViewId {
+    fn from(id: u16) -> ViewId {
+        ViewId(id)
+    }
+}
+
 impl fmt::Display for ViewId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.0.fmt(f)

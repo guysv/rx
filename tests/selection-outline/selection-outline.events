@@ -1,0 +1,68 @@
+00000 0000010 cursor/moved 610 330
+00010 0000100 keyboard/input v pressed
+00015 0000150 keyboard/input v released
+00030 0000300 mouse/input pressed
+00040 0000400 cursor/moved 660 380
+00050 0000500 mouse/input released
+00070 0000700 char/received ':'
+00080 0000800 char/received 's'
+00090 0000900 char/received 'e'
+00100 0001000 char/received 'l'
+00110 0001100 char/received 'e'
+00120 0001200 char/received 'c'
+00130 0001300 char/received 't'
+00140 0001400 char/received 'i'
+00150 0001500 char/received 'o'
+00160 0001600 char/received 'n'
+00170 0001700 char/received '/'
+00180 0001800 char/received 'e'
+00190 0001900 char/received 'r'
+00200 0002000 char/received 'a'
+00210 0002100 char/received 's'
+00220 0002200 char/received 'e'
+00230 0002300 keyboard/input <return> pressed
+00235 0002350 keyboard/input <return> released
+00260 0002600 char/received ':'
+00270 0002700 char/received 's'
+00280 0002800 char/received 'e'
+00290 0002900 char/received 'l'
+00300 0003000 char/received 'e'
+00310 0003100 char/received 'c'
+00320 0003200 char/received 't'
+00330 0003300 char/received 'i'
+00340 0003400 char/received 'o'
+00350 0003500 char/received 'n'
+00360 0003600 char/received '/'
+00370 0003700 char/received 'e'
+00380 0003800 char/received 'x'
+00390 0003900 char/received 'p'
+00400 0004000 char/received 'a'
+00410 0004100 char/received 'n'
+00420 0004200 char/received 'd'
+00430 0004300 keyboard/input <return> pressed
+00435 0004350 keyboard/input <return> released
+00460 0004600 char/received ':'
+00470 0004700 char/received 's'
+00480 0004800 char/received 'e'
+00490 0004900 char/received 'l'
+00500 0005000 char/received 'e'
+00510 0005100 char/received 'c'
+00520 0005200 char/received 't'
+00530 0005300 char/received 'i'
+00540 0005400 char/received 'o'
+00550 0005500 char/received 'n'
+00560 0005600 char/received '/'
+00570 0005700 char/received 'o'
+00580 0005800 char/received 'u'
+00590 0005900 char/received 't'
+00600 0006000 char/received 'l'
+00610 0006100 char/received 'i'
+00620 0006200 char/received 'n'
+00630 0006300 char/received 'e'
+00640 0006400 keyboard/input <return> pressed
+00645 0006450 keyboard/input <return> released
+00690 0006900 keyboard/input <esc> pressed
+00695 0006950 keyboard/input <esc> released
+00720 0007200 keyboard/input u pressed
+00725 0007250 keyboard/input u released
+00760 0007600 cursor/moved 611 331

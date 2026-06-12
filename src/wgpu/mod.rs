@@ -1483,8 +1483,21 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         }
 
         // Script `shade` stage: plugins record their own passes after
-        // view content, before screen composition.
-        let mut encoder = plugins.dispatch_shade(session, encoder);
+        // view content, before screen composition. Each view's layer
+        // texture is exposed as a named render target.
+        let mut view_targets = crate::script::ViewTargets::new();
+        for (id, vd) in &self.view_data {
+            let tex = &vd.layer.texture;
+            view_targets.insert(
+                u16::from(*id),
+                (
+                    tex.texture.create_view(&Default::default()),
+                    tex.size[0],
+                    tex.size[1],
+                ),
+            );
+        }
+        let mut encoder = plugins.dispatch_shade(session, encoder, view_targets);
 
         // Render to screen framebuffer
         {
