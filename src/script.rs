@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rune::runtime::{RuntimeContext, VmError};
+use rune::runtime::{Function, RuntimeContext, VmError};
 use rune::{Context, Diagnostics, Source, Sources, Unit, Value, Vm};
 
 use crate::session::Session;
@@ -59,6 +59,178 @@ impl From<VmError> for ScriptError {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Script commands
+
+/// A typed parameter of a script command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParamType {
+    Int,
+    Float,
+    Str,
+    Color,
+    Bool,
+}
+
+impl ParamType {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Str => "str",
+            Self::Color => "color",
+            Self::Bool => "bool",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Param {
+    ty: ParamType,
+    optional: bool,
+}
+
+/// Parse a declared signature, e.g. `["int", "color?"]`. A `?` suffix
+/// marks the parameter optional; optional parameters must come last.
+fn parse_sig(sig: &[String]) -> Result<Vec<Param>, String> {
+    let mut params: Vec<Param> = Vec::with_capacity(sig.len());
+    for s in sig {
+        let (name, optional) = match s.strip_suffix('?') {
+            Some(n) => (n, true),
+            None => (s.as_str(), false),
+        };
+        let ty = match name {
+            "int" => ParamType::Int,
+            "float" => ParamType::Float,
+            "str" => ParamType::Str,
+            "color" => ParamType::Color,
+            "bool" => ParamType::Bool,
+            other => return Err(format!("unknown parameter type `{}`", other)),
+        };
+        if !optional && params.last().is_some_and(|p| p.optional) {
+            return Err("required parameter after optional parameter".to_string());
+        }
+        params.push(Param { ty, optional });
+    }
+    Ok(params)
+}
+
+/// `usage: <name> <int> [color]` — for dispatch-time argument errors.
+fn usage(name: &str, params: &[Param]) -> String {
+    let mut s = format!("usage: {}", name);
+    for p in params {
+        if p.optional {
+            s.push_str(&format!(" [{}]", p.ty.name()));
+        } else {
+            s.push_str(&format!(" <{}>", p.ty.name()));
+        }
+    }
+    s
+}
+
+/// Parse raw invocation arguments against a declared signature into Rune
+/// values (i64, f64, String, Rgba8, bool).
+fn parse_args(name: &str, params: &[Param], raw: &str) -> Result<Vec<Value>, String> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let required = params.iter().filter(|p| !p.optional).count();
+    if tokens.len() < required || tokens.len() > params.len() {
+        return Err(usage(name, params));
+    }
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for (tok, param) in tokens.iter().zip(params) {
+        let value = match param.ty {
+            ParamType::Int => tok
+                .parse::<i64>()
+                .ok()
+                .and_then(|n| rune::to_value(n).ok()),
+            ParamType::Float => tok
+                .parse::<f64>()
+                .ok()
+                .and_then(|n| rune::to_value(n).ok()),
+            ParamType::Str => rune::to_value(tok.to_string()).ok(),
+            ParamType::Bool => match *tok {
+                "on" | "true" => rune::to_value(true).ok(),
+                "off" | "false" => rune::to_value(false).ok(),
+                _ => None,
+            },
+            ParamType::Color => {
+                // Guard the length: `Rgba8::from_str` slices bytes.
+                if tok.len() == 7 && tok.starts_with('#') && tok.is_ascii() {
+                    tok.parse::<crate::gfx::color::Rgba8>()
+                        .ok()
+                        .and_then(|c| rune::to_value(c).ok())
+                } else {
+                    None
+                }
+            }
+        };
+        match value {
+            Some(v) => out.push(v),
+            None => {
+                return Err(format!(
+                    "invalid {} `{}`; {}",
+                    param.ty.name(),
+                    tok,
+                    usage(name, params)
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A command registered by a plugin.
+pub struct ScriptCommand {
+    pub name: String,
+    pub help: String,
+    pub repeating: bool,
+    /// Owning plugin; handlers run with this plugin's state.
+    pub plugin: String,
+    params: Vec<Param>,
+    handler: Function,
+}
+
+/// All commands registered by loaded plugins. Owned by [`PluginHost`];
+/// reachable from hooks through [`Ctx`] for registration.
+#[derive(Default)]
+pub struct ScriptCommands {
+    entries: Vec<ScriptCommand>,
+}
+
+impl ScriptCommands {
+    fn register(&mut self, cmd: ScriptCommand) -> Result<(), String> {
+        if let Some(existing) = self.entries.iter().find(|c| c.name == cmd.name) {
+            return Err(format!(
+                "command ':{}' is already registered by plugin `{}`",
+                cmd.name, existing.plugin
+            ));
+        }
+        self.entries.push(cmd);
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ScriptCommand> {
+        self.entries.iter().find(|c| c.name == name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ScriptCommand> {
+        self.entries.iter()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// `(name, help)` pairs for the help view.
+    fn help_entries(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|c| (c.name.clone(), c.help.clone()))
+            .collect()
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////
 // Ctx
 
 /// The context object passed to every plugin hook as `rx`.
@@ -72,6 +244,10 @@ pub struct Ctx {
     session: *mut Session,
     /// Draw sink; non-null only during the `draw` hook.
     draw: *mut crate::draw::Context,
+    /// Command registry; non-null only for calls made by the plugin host.
+    cmds: *mut ScriptCommands,
+    /// Name of the plugin whose hook is running (owner of registrations).
+    plugin: String,
 }
 
 impl Ctx {
@@ -86,6 +262,8 @@ impl Ctx {
         Ctx {
             session: session as *mut Session,
             draw: std::ptr::null_mut(),
+            cmds: std::ptr::null_mut(),
+            plugin: String::new(),
         }
     }
 
@@ -95,7 +273,17 @@ impl Ctx {
         Ctx {
             session: session as *mut Session,
             draw: draw as *mut crate::draw::Context,
+            cmds: std::ptr::null_mut(),
+            plugin: String::new(),
         }
+    }
+
+    /// Attach the command registry and the calling plugin's name. Same
+    /// safety contract as [`Ctx::new`], extended to `cmds`.
+    pub fn with_commands(mut self, cmds: &mut ScriptCommands, plugin: &str) -> Self {
+        self.cmds = cmds as *mut ScriptCommands;
+        self.plugin = plugin.to_string();
+        self
     }
 
     fn session(&self) -> &Session {
@@ -225,6 +413,121 @@ impl Ctx {
         self.session_mut().selection = None;
     }
 
+    /// Register a command: `rx.register_command(name, sig, help, handler)`.
+    ///
+    /// `sig` declares the typed parameters (`"int"`, `"float"`, `"str"`,
+    /// `"color"`, `"bool"`; suffix `?` for optional). The handler is called
+    /// as `handler(state, rx, args)` with `args` a vector of parsed values.
+    /// Returns whether registration succeeded.
+    #[rune::function]
+    fn register_command(&mut self, name: &str, sig: Vec<String>, help: &str, handler: Function) -> bool {
+        self.register_cmd(name, sig, help, handler, false)
+    }
+
+    /// Like `register_command`, but the command repeats while its bound
+    /// key is held.
+    #[rune::function]
+    fn register_command_repeating(
+        &mut self,
+        name: &str,
+        sig: Vec<String>,
+        help: &str,
+        handler: Function,
+    ) -> bool {
+        self.register_cmd(name, sig, help, handler, true)
+    }
+
+    fn register_cmd(
+        &mut self,
+        name: &str,
+        sig: Vec<String>,
+        help: &str,
+        handler: Function,
+        repeating: bool,
+    ) -> bool {
+        use crate::session::MessageType;
+
+        if self.cmds.is_null() {
+            self.session_mut().message(
+                format!("Error: ':{}' cannot be registered in this context", name),
+                MessageType::Error,
+            );
+            return false;
+        }
+        // Builtins always win at parse time; a shadowing registration
+        // would never be dispatched, so reject it loudly.
+        if self
+            .session()
+            .cmdline
+            .commands
+            .iter()
+            .any(|(n, _, _)| *n == name)
+        {
+            self.session_mut().message(
+                format!("Error: ':{}' would shadow a builtin command", name),
+                MessageType::Error,
+            );
+            return false;
+        }
+        let params = match parse_sig(&sig) {
+            Ok(p) => p,
+            Err(e) => {
+                self.session_mut().message(
+                    format!("Error registering ':{}': {}", name, e),
+                    MessageType::Error,
+                );
+                return false;
+            }
+        };
+        let entry = ScriptCommand {
+            name: name.to_string(),
+            help: help.to_string(),
+            repeating,
+            plugin: self.plugin.clone(),
+            params,
+            handler,
+        };
+        let result = unsafe { &mut *self.cmds }.register(entry);
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.session_mut()
+                    .message(format!("Error: {}", e), MessageType::Error);
+                false
+            }
+        }
+    }
+
+    /// Run a builtin command, e.g. `rx.run_builtin("v/center")`. Script
+    /// commands are not resolvable through this; it exists so handlers
+    /// can delegate to (or compose) default behavior. Returns whether the
+    /// invocation parsed and ran.
+    #[rune::function]
+    fn run_builtin(&mut self, invocation: &str) -> bool {
+        use crate::cmd::Command;
+        use crate::session::MessageType;
+
+        let input = format!(":{}", invocation.trim());
+        let session = self.session_mut();
+        match session.cmdline.parse(&input) {
+            Ok(Command::Script(name, _)) => {
+                session.message(
+                    format!("Error: ':{}' is not a builtin command", name),
+                    MessageType::Error,
+                );
+                false
+            }
+            Ok(cmd) => {
+                session.command(cmd);
+                true
+            }
+            Err(e) => {
+                session.message(format!("Error: {}", e), MessageType::Error);
+                false
+            }
+        }
+    }
+
     /// Draw text at `(x, y)` in UI coordinates. Only valid inside the
     /// `draw` hook; a no-op elsewhere.
     #[rune::function]
@@ -303,6 +606,9 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::selection)?;
     m.function_meta(Ctx::set_selection)?;
     m.function_meta(Ctx::clear_selection)?;
+    m.function_meta(Ctx::register_command)?;
+    m.function_meta(Ctx::register_command_repeating)?;
+    m.function_meta(Ctx::run_builtin)?;
     m.function_meta(Ctx::draw_text)?;
     m.function_meta(Ctx::draw_line)?;
     m.function_meta(rgb)?;
@@ -452,6 +758,8 @@ pub struct Plugin {
 pub struct PluginHost {
     engine: ScriptEngine,
     plugins: Vec<Plugin>,
+    /// Commands registered by plugins (cleared on unload/reload).
+    commands: ScriptCommands,
     dir: Option<std::path::PathBuf>,
     watcher: Option<ReloadWatcher>,
     /// Last mode reported to `switch_mode` hooks (edge detection).
@@ -461,23 +769,25 @@ pub struct PluginHost {
 /// Loop over enabled plugins defining `$hook` and call it; disable a
 /// plugin whose hook errors. A macro rather than a generic fn: the
 /// argument tuple borrows a per-call local `Ctx`, which a closure-based
-/// helper can't express without aliasing the host.
+/// helper can't express without aliasing the host. `$plugins`/`$cmds`
+/// are the host's fields, split-borrowed by the caller.
 macro_rules! dispatch {
-    ($host:expr, $session:expr, $hook:expr, |$state:ident, $ctx:ident| $args:tt) => {
-        for i in 0..$host.plugins.len() {
+    ($plugins:expr, $cmds:expr, $session:expr, $hook:expr, |$state:ident, $ctx:ident| $args:tt) => {
+        for i in 0..$plugins.len() {
             {
-                let plugin = &$host.plugins[i];
+                let plugin = &$plugins[i];
                 if !plugin.enabled || !plugin.script.has_fn($hook) {
                     continue;
                 }
             }
-            let $state = $host.plugins[i].state.clone();
-            let mut ctx = Ctx::new($session);
+            let $state = $plugins[i].state.clone();
+            let name = $plugins[i].name.clone();
+            let mut ctx = Ctx::new($session).with_commands(&mut *$cmds, &name);
             let $ctx = &mut ctx;
-            let result = $host.plugins[i].script.call($hook, $args);
+            let result = $plugins[i].script.call($hook, $args);
             drop(ctx);
             if let Err(e) = result {
-                let plugin = &mut $host.plugins[i];
+                let plugin = &mut $plugins[i];
                 plugin.enabled = false;
                 log::error!("plugin `{}` {}: {}", plugin.name, $hook, e);
                 let name = plugin.name.clone();
@@ -501,6 +811,7 @@ impl PluginHost {
         Ok(Self {
             engine,
             plugins: Vec::new(),
+            commands: ScriptCommands::default(),
             dir,
             watcher,
             last_mode: None,
@@ -563,7 +874,7 @@ impl PluginHost {
                 }
             };
             let state = {
-                let mut ctx = Ctx::new(session);
+                let mut ctx = Ctx::new(session).with_commands(&mut self.commands, &name);
                 match script.call("init", (&mut ctx,)) {
                     Ok(v) => v,
                     Err(e) => {
@@ -584,9 +895,13 @@ impl PluginHost {
                 enabled: true,
             });
         }
+        session
+            .cmdline
+            .set_script_commands(self.commands.help_entries());
     }
 
-    /// Call `unload` on every plugin that defines it, then drop them all.
+    /// Call `unload` on every plugin that defines it, then drop them all
+    /// along with their command registrations.
     pub fn unload(&mut self, session: &mut Session) {
         for plugin in self.plugins.drain(..) {
             let mut ctx = Ctx::new(session);
@@ -600,6 +915,8 @@ impl PluginHost {
                 }
             }
         }
+        self.commands.clear();
+        session.cmdline.set_script_commands(Vec::new());
     }
 
     /// Reload all plugins if the watcher saw a change. Returns whether a
@@ -630,14 +947,20 @@ impl PluginHost {
     /// Cursor moved (window logical coordinates). Runs before builtin
     /// event handling.
     pub fn dispatch_cursor_moved(&mut self, session: &mut Session, x: f64, y: f64) {
-        dispatch!(self, session, "cursor_moved", |state, ctx| (
+        let Self {
+            plugins, commands, ..
+        } = self;
+        dispatch!(plugins, commands, session, "cursor_moved", |state, ctx| (
             state, ctx, x, y
         ));
     }
 
     /// Mouse button input. Runs before builtin event handling.
     pub fn dispatch_mouse_input(&mut self, session: &mut Session, button: &str, input: &str) {
-        dispatch!(self, session, "mouse_input", |state, ctx| (
+        let Self {
+            plugins, commands, ..
+        } = self;
+        dispatch!(plugins, commands, session, "mouse_input", |state, ctx| (
             state,
             ctx,
             button.to_string(),
@@ -649,29 +972,124 @@ impl PluginHost {
     /// `update`.
     pub fn dispatch_update(&mut self, session: &mut Session) {
         let mode = session.mode.to_string();
-        if self.last_mode.as_deref() != Some(mode.as_str()) {
+        let switched = self.last_mode.as_deref() != Some(mode.as_str());
+        if switched {
             self.last_mode = Some(mode);
-            dispatch!(self, session, "switch_mode", |state, ctx| (state, ctx));
         }
-        dispatch!(self, session, "update", |state, ctx| (state, ctx));
+        let Self {
+            plugins, commands, ..
+        } = self;
+        if switched {
+            dispatch!(plugins, commands, session, "switch_mode", |state, ctx| (
+                state, ctx
+            ));
+        }
+        dispatch!(plugins, commands, session, "update", |state, ctx| (
+            state, ctx
+        ));
+    }
+
+    /// Dispatch a script command invocation: resolve `name` in the
+    /// registry, parse `raw` against the declared signature, and call the
+    /// handler as `handler(state, rx, args)` with the owning plugin's
+    /// state. Errors (unknown command, bad arguments, disabled plugin)
+    /// land in the message line.
+    pub fn dispatch_command(&mut self, session: &mut Session, name: &str, raw: &str) {
+        use crate::session::MessageType;
+        use rune::alloc::clone::TryClone;
+
+        let (params, handler, plugin_name) = match self.commands.get(name) {
+            Some(c) => match c.handler.try_clone() {
+                Ok(handler) => (c.params.clone(), handler, c.plugin.clone()),
+                Err(e) => {
+                    session.message(format!("Error: ':{}': {}", name, e), MessageType::Error);
+                    return;
+                }
+            },
+            None => {
+                session.message(
+                    format!("Error: unknown command: {}", name),
+                    MessageType::Error,
+                );
+                return;
+            }
+        };
+        let args = match parse_args(name, &params, raw) {
+            Ok(a) => a,
+            Err(e) => {
+                session.message(format!("Error: {}", e), MessageType::Error);
+                return;
+            }
+        };
+        let args = match rune::to_value(args) {
+            Ok(v) => v,
+            Err(e) => {
+                session.message(format!("Error: {}", e), MessageType::Error);
+                return;
+            }
+        };
+        let Some(i) = self
+            .plugins
+            .iter()
+            .position(|p| p.name == plugin_name && p.enabled)
+        else {
+            session.message(
+                format!("Error: ':{}': plugin `{}` is not loaded", name, plugin_name),
+                MessageType::Error,
+            );
+            return;
+        };
+        let state = self.plugins[i].state.clone();
+        let Self {
+            plugins, commands, ..
+        } = self;
+        let mut ctx = Ctx::new(session).with_commands(commands, &plugin_name);
+        let result = handler
+            .call::<Value>((state, &mut ctx, args))
+            .into_result()
+            .map_err(|e| ScriptError::Vm(e.to_string()));
+        drop(ctx);
+        if let Err(e) = result {
+            let plugin = &mut plugins[i];
+            plugin.enabled = false;
+            log::error!("plugin `{}` :{}: {}", plugin.name, name, e);
+            session.message(
+                format!("Plugin `{}` disabled: {}", plugin_name, first_line(&e)),
+                MessageType::Error,
+            );
+        }
+    }
+
+    /// Whether a registered script command repeats on key-hold.
+    pub fn command_repeats(&self, name: &str) -> bool {
+        self.commands.get(name).is_some_and(|c| c.repeating)
+    }
+
+    /// The script command registry (read access, e.g. for help).
+    pub fn commands(&self) -> &ScriptCommands {
+        &self.commands
     }
 
     /// The per-frame `draw` hook: scripts populate the UI batches through
     /// `rx.draw_text` / `rx.draw_line`.
     pub fn dispatch_draw(&mut self, session: &mut Session, draw: &mut crate::draw::Context) {
-        for i in 0..self.plugins.len() {
+        let Self {
+            plugins, commands, ..
+        } = self;
+        for i in 0..plugins.len() {
             {
-                let plugin = &self.plugins[i];
+                let plugin = &plugins[i];
                 if !plugin.enabled || !plugin.script.has_fn("draw") {
                     continue;
                 }
             }
-            let state = self.plugins[i].state.clone();
-            let mut ctx = Ctx::with_draw(session, draw);
-            let result = self.plugins[i].script.call("draw", (state, &mut ctx));
+            let state = plugins[i].state.clone();
+            let name = plugins[i].name.clone();
+            let mut ctx = Ctx::with_draw(session, draw).with_commands(&mut *commands, &name);
+            let result = plugins[i].script.call("draw", (state, &mut ctx));
             drop(ctx);
             if let Err(e) = result {
-                let plugin = &mut self.plugins[i];
+                let plugin = &mut plugins[i];
                 plugin.enabled = false;
                 log::error!("plugin `{}` draw: {}", plugin.name, e);
                 let name = plugin.name.clone();
@@ -687,6 +1105,9 @@ impl PluginHost {
     pub fn dispatch_effects(&mut self, session: &mut Session, effects: &[crate::session::Effect]) {
         use crate::session::Effect;
 
+        let Self {
+            plugins, commands, ..
+        } = self;
         for effect in effects {
             let (hook, id) = match effect {
                 Effect::ViewAdded(id) => ("view_added", *id),
@@ -696,9 +1117,13 @@ impl PluginHost {
             let id = u16::from(id) as i64;
             match hook {
                 "view_added" => {
-                    dispatch!(self, session, "view_added", |state, ctx| (state, ctx, id))
+                    dispatch!(plugins, commands, session, "view_added", |state, ctx| (
+                        state, ctx, id
+                    ))
                 }
-                _ => dispatch!(self, session, "view_removed", |state, ctx| (state, ctx, id)),
+                _ => dispatch!(plugins, commands, session, "view_removed", |state, ctx| (
+                    state, ctx, id
+                )),
             }
         }
     }
@@ -1280,6 +1705,223 @@ mod test {
         assert_eq!(draw_ctx.ui_batch.vertices().len(), 6);
         // Drawing outside the draw hook is a no-op, not a crash.
         host.dispatch_update(&mut session);
+    }
+
+    #[test]
+    fn register_and_dispatch_typed_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("greet", ["str", "int?"], "Greet someone", greet);
+                #{ calls: 0 }
+            }
+            pub fn greet(state, rx, args) {
+                state.calls += 1;
+                if args.len() == 2 {
+                    rx.message(`hi ${args[0]} x${args[1]} (#${state.calls})`);
+                } else {
+                    rx.message(`hi ${args[0]} (#${state.calls})`);
+                }
+            }
+            "#,
+        );
+
+        host.dispatch_command(&mut session, "greet", "world 3");
+        assert_eq!(session.message.to_string(), "hi world x3 (#1)");
+
+        // Optional argument omitted; state persists across calls.
+        host.dispatch_command(&mut session, "greet", "moon");
+        assert_eq!(session.message.to_string(), "hi moon (#2)");
+    }
+
+    #[test]
+    fn command_argument_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("paint", ["int", "color"], "Paint", paint);
+                #{}
+            }
+            pub fn paint(state, rx, args) { rx.message("painted"); }
+            "#,
+        );
+
+        // Too few arguments.
+        host.dispatch_command(&mut session, "paint", "1");
+        assert_eq!(
+            session.message.to_string(),
+            "Error: usage: paint <int> <color>"
+        );
+
+        // Bad int.
+        host.dispatch_command(&mut session, "paint", "x #ff0000");
+        assert!(session.message.to_string().contains("invalid int `x`"));
+
+        // Bad color (also: must not panic on short tokens).
+        host.dispatch_command(&mut session, "paint", "1 #f");
+        assert!(session.message.to_string().contains("invalid color `#f`"));
+
+        // Too many arguments.
+        host.dispatch_command(&mut session, "paint", "1 #ff0000 extra");
+        assert!(session.message.to_string().contains("usage: paint"));
+
+        // Valid invocation.
+        host.dispatch_command(&mut session, "paint", "1 #ff0000");
+        assert_eq!(session.message.to_string(), "painted");
+    }
+
+    #[test]
+    fn unknown_command_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(dir.path(), "p", "pub fn init(rx) { #{} }");
+
+        host.dispatch_command(&mut session, "no/such", "");
+        assert_eq!(session.message.to_string(), "Error: unknown command: no/such");
+    }
+
+    #[test]
+    fn run_builtin_delegates_to_builtin_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("debug/on", [], "Enable debug", handler);
+                #{}
+            }
+            pub fn handler(state, rx, args) {
+                let ok = rx.run_builtin("set debug = on");
+                let not_builtin = rx.run_builtin("no/such/builtin");
+                if ok && !not_builtin {
+                    rx.message("delegated");
+                }
+            }
+            "#,
+        );
+
+        host.dispatch_command(&mut session, "debug/on", "");
+        assert_eq!(session.message.to_string(), "delegated");
+        assert!(session.settings["debug"].is_set());
+    }
+
+    #[test]
+    fn command_registry_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("mine", [], "My command", handler);
+                rx.register_command_repeating("again", [], "Repeats", handler);
+                #{}
+            }
+            pub fn handler(state, rx, args) { rx.message("ran"); }
+            "#,
+        );
+
+        // Declared metadata is queryable and synced to the help list.
+        assert!(!host.command_repeats("mine"));
+        assert!(host.command_repeats("again"));
+        assert_eq!(
+            session.cmdline.commands.script_commands(),
+            &[
+                ("mine".to_string(), "My command".to_string()),
+                ("again".to_string(), "Repeats".to_string())
+            ]
+        );
+
+        // Re-registering after reload works (the registry is cleared).
+        host.reload(&mut session);
+        host.dispatch_command(&mut session, "mine", "");
+        assert_eq!(session.message.to_string(), "ran");
+
+        // A plugin that goes away takes its commands with it.
+        std::fs::write(
+            dir.path().join("p.rune"),
+            "pub fn init(rx) { #{} }",
+        )
+        .unwrap();
+        host.reload(&mut session);
+        assert!(session.cmdline.commands.script_commands().is_empty());
+        host.dispatch_command(&mut session, "mine", "");
+        assert_eq!(session.message.to_string(), "Error: unknown command: mine");
+    }
+
+    #[test]
+    fn command_registration_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        // `a` registers first (lexicographic load order); `b` collides.
+        write_plugin(
+            dir.path(),
+            "a",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("shared", [], "From a", handler);
+                #{}
+            }
+            pub fn handler(state, rx, args) { rx.message("a ran"); }
+            "#,
+        );
+        write_plugin(
+            dir.path(),
+            "b",
+            r#"
+            pub fn init(rx) {
+                let dup = rx.register_command("shared", [], "From b", handler);
+                let builtin = rx.register_command("undo", [], "Shadow", handler);
+                let bad_sig = rx.register_command("sig", ["nope"], "Bad", handler);
+                if !dup && !builtin && !bad_sig {
+                    rx.message("all rejected");
+                }
+                #{}
+            }
+            pub fn handler(state, rx, args) { rx.message("b ran"); }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(session.message.to_string(), "all rejected");
+
+        // First registration wins.
+        host.dispatch_command(&mut session, "shared", "");
+        assert_eq!(session.message.to_string(), "a ran");
+    }
+
+    #[test]
+    fn erroring_command_handler_disables_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("boom", [], "Explode", handler);
+                #{}
+            }
+            pub fn handler(state, rx, args) { None.unwrap() }
+            "#,
+        );
+
+        host.dispatch_command(&mut session, "boom", "");
+        assert!(session.message.to_string().starts_with("Plugin `p` disabled"));
+        assert_eq!(host.plugins().filter(|p| p.enabled).count(), 0);
+
+        // Disabled plugin's commands report instead of running.
+        host.dispatch_command(&mut session, "boom", "");
+        assert_eq!(
+            session.message.to_string(),
+            "Error: ':boom': plugin `p` is not loaded"
+        );
     }
 
     #[test]

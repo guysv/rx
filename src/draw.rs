@@ -845,6 +845,43 @@ pub fn draw_help(session: &Session, text: &mut TextBatch, shape: &mut shape2d::B
             );
         }
     }
+    // Plugin-registered commands, from their declarations.
+    let script_cmds = session.cmdline.commands.script_commands();
+    if !script_cmds.is_empty() {
+        if let Some(y) = line.nth(1) {
+            text.add(
+                "PLUGIN COMMANDS",
+                left_margin,
+                y as f32,
+                self::HELP_LAYER,
+                color::RED,
+                TextAlign::Left,
+            );
+        }
+        line.next();
+
+        for (name, help) in script_cmds {
+            if let Some(y) = line.next() {
+                text.add(
+                    &format!(":{}", name),
+                    left_margin,
+                    y as f32,
+                    self::HELP_LAYER,
+                    color::RED,
+                    TextAlign::Left,
+                );
+                text.add(
+                    help,
+                    left_margin + column_offset,
+                    y as f32,
+                    self::HELP_LAYER,
+                    color::LIGHT_GREY,
+                    TextAlign::Left,
+                );
+            }
+        }
+    }
+
     for l in session::SETTINGS.lines() {
         if let Some(y) = line.next() {
             text.add(

@@ -1217,6 +1217,7 @@ impl Session {
                     state: InputState::Released,
                 },
                 &mut Execution::Normal,
+                None,
             );
         }
         if self.mouse_state == InputState::Pressed {
@@ -1819,8 +1820,8 @@ impl Session {
                     self.handle_cursor_moved(coords);
                 }
             }
-            Event::KeyboardInput(input) => self.handle_keyboard_input(input, exec),
-            Event::ReceivedCharacter(c, mods) => self.handle_received_character(c, mods),
+            Event::KeyboardInput(input) => self.handle_keyboard_input(input, exec, Some(plugins)),
+            Event::ReceivedCharacter(c, mods) => self.handle_received_character(c, mods, plugins),
             Event::Paste(p) => self.handle_paste(p),
         }
     }
@@ -2071,7 +2072,12 @@ impl Session {
         }
     }
 
-    fn handle_received_character(&mut self, c: char, mods: ModifiersState) {
+    fn handle_received_character(
+        &mut self,
+        c: char,
+        mods: ModifiersState,
+        plugins: &mut crate::script::PluginHost,
+    ) {
         if self.mode == Mode::Command {
             if c.is_control() || self.ignore_received_characters {
                 return;
@@ -2081,11 +2087,19 @@ impl Session {
             self.key_bindings
                 .find(Input::Character(c), mods, InputState::Pressed, self.mode)
         {
-            self.command(kb.command);
+            self.run_command(kb.command, plugins);
         }
     }
 
-    fn handle_keyboard_input(&mut self, input: platform::KeyboardInput, exec: &mut Execution) {
+    /// `plugins` is `None` only for synthesized events (input release on
+    /// mode switches); a script command bound there reports an error
+    /// instead of dispatching.
+    fn handle_keyboard_input(
+        &mut self,
+        input: platform::KeyboardInput,
+        exec: &mut Execution,
+        mut plugins: Option<&mut crate::script::PluginHost>,
+    ) {
         let KeyboardInput {
             state,
             modifiers,
@@ -2133,7 +2147,7 @@ impl Session {
                                 self.cmdline_handle_backspace();
                             }
                             platform::Key::Return => {
-                                self.cmdline_handle_enter();
+                                self.cmdline_handle_enter(plugins.as_deref_mut());
                             }
                             platform::Key::Escape => {
                                 self.cmdline_hide();
@@ -2163,9 +2177,19 @@ impl Session {
             {
                 // For toggle-like key bindings, we don't want to run the command
                 // on key repeats. For regular key bindings, we run the command
-                // depending on if it's supposed to repeat.
-                if (repeat && kb.command.repeats() && !kb.is_toggle) || !repeat {
-                    self.command(kb.command);
+                // depending on if it's supposed to repeat. Script commands
+                // declare repeatability at registration.
+                let repeats = match &kb.command {
+                    Command::Script(name, _) => plugins
+                        .as_ref()
+                        .is_some_and(|p| p.command_repeats(name)),
+                    cmd => cmd.repeats(),
+                };
+                if (repeat && repeats && !kb.is_toggle) || !repeat {
+                    match plugins {
+                        Some(p) => self.run_command(kb.command, p),
+                        None => self.command(kb.command),
+                    }
                 }
                 return;
             }
@@ -2370,8 +2394,18 @@ impl Session {
     /// Commands
     ///////////////////////////////////////////////////////////////////////////
 
-    /// Process a command.
-    fn command(&mut self, cmd: Command) {
+    /// Run a command, routing script commands to the plugin host and
+    /// everything else to the builtin implementation. This is the entry
+    /// point for user-originated commands (command line, key bindings).
+    pub(crate) fn run_command(&mut self, cmd: Command, plugins: &mut crate::script::PluginHost) {
+        match cmd {
+            Command::Script(name, args) => plugins.dispatch_command(self, &name, &args),
+            cmd => self.command(cmd),
+        }
+    }
+
+    /// Process a builtin command.
+    pub(crate) fn command(&mut self, cmd: Command) {
         debug!("command: {:?}", cmd);
 
         match cmd {
@@ -2692,6 +2726,16 @@ impl Session {
             },
             Command::Noop => {
                 // Nothing happening!
+            }
+            Command::Script(ref name, _) => {
+                // Script commands dispatch through `run_command`, which
+                // routes them to the plugin host. Reaching this arm means
+                // the calling context has no plugin access (e.g. a
+                // sourced config file).
+                self.message(
+                    format!("Error: ':{}' is not available in this context", name),
+                    MessageType::Error,
+                );
             }
             Command::ChangeDir(dir) => {
                 let home = self.base_dirs.home_dir().to_path_buf();
@@ -3031,7 +3075,7 @@ impl Session {
         }
     }
 
-    fn cmdline_handle_enter(&mut self) {
+    fn cmdline_handle_enter(&mut self, plugins: Option<&mut crate::script::PluginHost>) {
         let input = self.cmdline.input();
         // Always hide the command line before executing the command,
         // because commands will often require being in a specific mode, eg.
@@ -3045,7 +3089,10 @@ impl Session {
         match self.cmdline.parse(&input) {
             Err(e) => self.message(format!("Error: {}", e), MessageType::Error),
             Ok(cmd) => {
-                self.command(cmd);
+                match plugins {
+                    Some(p) => self.run_command(cmd, p),
+                    None => self.command(cmd),
+                }
                 self.cmdline.history.add(input);
             }
         }
