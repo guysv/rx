@@ -77,6 +77,7 @@ pub struct Options<'a> {
     pub resizable: bool,
     pub headless: bool,
     pub source: Option<PathBuf>,
+    pub plugin_dir: Option<PathBuf>,
     pub exec: ExecutionMode,
     pub glyphs: &'a [u8],
     pub debug: bool,
@@ -90,6 +91,7 @@ impl<'a> Default for Options<'a> {
             headless: false,
             resizable: true,
             source: None,
+            plugin_dir: None,
             exec: ExecutionMode::Normal,
             glyphs: data::GLYPHS,
             debug: false,
@@ -165,6 +167,10 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
     }
 
     let wait_events = execution.is_normal() || execution.is_recording();
+
+    let mut plugins = script::PluginHost::new(options.plugin_dir.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    plugins.load(&mut session);
 
     let mut renderer: wgpu::Renderer = Renderer::new(&mut win, win_size, scale_factor, assets)?;
 
@@ -304,6 +310,8 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
             resized = false;
             session.handle_resized(win.size());
         }
+
+        plugins.reload_if_changed(&mut session);
 
         delta = last.elapsed();
         last += delta;
