@@ -32,6 +32,8 @@ wgpu = "23"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 env_logger = "0.11.8"
+rune = "0.14"
+notify = "8"
 
 [dev-dependencies]
 lazy_static = "1.3"
