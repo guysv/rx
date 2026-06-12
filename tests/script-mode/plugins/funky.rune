@@ -1,0 +1,17 @@
+// Fixture plugin: a custom script mode. `:funky` enters the mode, the
+// draw hook makes the mode digest-visible, escape exits it (builtin
+// catch-all — that's what the replay proves).
+pub fn init(rx) {
+    rx.register_command("funky", [], "Enter funky mode", funky);
+    #{}
+}
+
+pub fn funky(state, rx, args) {
+    rx.switch_mode("funky");
+}
+
+pub fn draw(state, rx) {
+    if rx.mode() == "funky" {
+        rx.draw_text("-- FUNKY --", 10.0, 46.0, rx::rgb(0, 255, 0));
+    }
+}

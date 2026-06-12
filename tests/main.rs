@@ -120,6 +120,11 @@ fn cmd_script() {
 }
 
 #[test]
+fn script_mode() {
+    test("script-mode");
+}
+
+#[test]
 fn source() {
     test("source");
 }

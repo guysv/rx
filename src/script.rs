@@ -314,6 +314,36 @@ impl Ctx {
         self.session().prev_mode.as_ref().map(|m| m.to_string())
     }
 
+    /// Switch the session mode. Builtin mode names (`normal`, `visual`,
+    /// `command`, `present`, `help`) switch to the builtin mode; any
+    /// other name enters a custom script mode (escape exits it, builtin
+    /// input handling is inert in it). Returns whether the switch was
+    /// accepted.
+    #[rune::function]
+    fn switch_mode(&mut self, name: &str) -> bool {
+        use crate::session::{Mode, ModeString, VisualState};
+
+        let mode = match name {
+            "normal" => Mode::Normal,
+            "visual" => Mode::Visual(VisualState::default()),
+            "command" => Mode::Command,
+            "present" => Mode::Present,
+            "help" => Mode::Help,
+            custom => match ModeString::try_from_str(custom) {
+                Ok(s) if !s.is_empty() => Mode::Script(s),
+                _ => {
+                    self.session_mut().message(
+                        format!("Error: invalid mode name `{}`", custom),
+                        crate::session::MessageType::Error,
+                    );
+                    return false;
+                }
+            },
+        };
+        self.session_mut().switch_mode(mode);
+        true
+    }
+
     /// Post a message to the message line.
     #[rune::function]
     fn message(&mut self, msg: &str) {
@@ -598,6 +628,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.ty::<Ctx>()?;
     m.function_meta(Ctx::mode)?;
     m.function_meta(Ctx::prev_mode)?;
+    m.function_meta(Ctx::switch_mode)?;
     m.function_meta(Ctx::message)?;
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
@@ -1705,6 +1736,128 @@ mod test {
         assert_eq!(draw_ctx.ui_batch.vertices().len(), 6);
         // Drawing outside the draw hook is a no-op, not a crash.
         host.dispatch_update(&mut session);
+    }
+
+    #[test]
+    fn script_mode_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("probe", ["str"], "Switch and probe", probe);
+                #{}
+            }
+            pub fn probe(state, rx, args) {
+                let ok = rx.switch_mode(args[0]);
+                let prev = rx.prev_mode().unwrap_or("-");
+                rx.message(`${ok} ${rx.mode()} ${prev}`);
+            }
+            "#,
+        );
+
+        // Custom mode: accepted, prev_mode tracked.
+        host.dispatch_command(&mut session, "probe", "funky");
+        assert_eq!(session.message.to_string(), "true funky normal");
+        assert_eq!(session.mode.to_string(), "funky");
+
+        // Builtin name maps to the builtin mode.
+        host.dispatch_command(&mut session, "probe", "visual");
+        assert_eq!(session.mode, crate::session::Mode::Visual(Default::default()));
+
+        // An over-long name is rejected and the mode stays.
+        host.dispatch_command(
+            &mut session,
+            "probe",
+            "way-too-long-of-a-mode-name-to-be-allowed-in-here",
+        );
+        assert!(session.message.to_string().starts_with("false"));
+        assert_eq!(session.mode, crate::session::Mode::Visual(Default::default()));
+    }
+
+    #[test]
+    fn script_mode_click_does_not_pass_views() {
+        use crate::event::Event;
+        use crate::execution::Execution;
+        use crate::platform;
+        use crate::session::Mode;
+        use crate::view::FileStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(dir.path(), "p", "pub fn init(rx) { #{} }");
+        // The first view must not be a scratch pad (`NoFile`), or adding
+        // the second view would replace it.
+        let mut session = session.with_blank(
+            FileStatus::New(std::path::PathBuf::from("/tmp/rx-test-first.png").into()),
+            32,
+            32,
+        );
+        let first = session.views.active_id;
+        session.blank(FileStatus::NoFile, 32, 32);
+        let second = session.views.active_id;
+        assert_ne!(first, second);
+        session.activate(first);
+
+        let mut exec = Execution::normal().unwrap();
+        let click = || {
+            vec![
+                Event::MouseInput(platform::MouseButton::Left, platform::InputState::Pressed),
+                Event::MouseInput(platform::MouseButton::Left, platform::InputState::Released),
+            ]
+        };
+
+        // In a script mode, clicking a non-active view must not activate it.
+        session.switch_mode(Mode::Script("funky".try_into().unwrap()));
+        session.hover_view = Some(second);
+        session.update(
+            &mut click(),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.views.active_id, first);
+
+        // In normal mode the same click activates the hovered view.
+        session.switch_mode(Mode::Normal);
+        session.hover_view = Some(second);
+        session.update(
+            &mut click(),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.views.active_id, second);
+    }
+
+    #[test]
+    fn escape_exits_script_mode() {
+        use crate::event::Event;
+        use crate::execution::Execution;
+        use crate::platform;
+        use crate::session::Mode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(dir.path(), "p", "pub fn init(rx) { #{} }");
+        let mut session = session.with_blank(crate::view::FileStatus::NoFile, 32, 32);
+
+        session.switch_mode(Mode::Script("funky".try_into().unwrap()));
+        let mut exec = Execution::normal().unwrap();
+        let mut events = vec![Event::KeyboardInput(platform::KeyboardInput {
+            key: Some(platform::Key::Escape),
+            modifiers: platform::ModifiersState::default(),
+            state: platform::InputState::Pressed,
+        })];
+        session.update(
+            &mut events,
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.mode, Mode::Normal);
     }
 
     #[test]

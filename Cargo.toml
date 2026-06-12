@@ -34,6 +34,7 @@ pollster = "0.4"
 env_logger = "0.11.8"
 rune = "0.14"
 notify = "8"
+arraystring = "0.3"
 
 [dev-dependencies]
 lazy_static = "1.3"
