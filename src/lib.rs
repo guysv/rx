@@ -262,7 +262,7 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
                 WindowEvent::RedrawRequested => {
                     render_timer.run(|avg| {
                         renderer
-                            .frame(&mut session, &mut execution, vec![], &avg)
+                            .frame(&mut session, &mut execution, vec![], &avg, &mut plugins)
                             .unwrap_or_else(|err| {
                                 log::error!("{}", err);
                             });
@@ -337,7 +337,7 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
 
         render_timer.run(|avg| {
             renderer
-                .frame(&mut session, &mut execution, effects, &avg)
+                .frame(&mut session, &mut execution, effects, &avg, &mut plugins)
                 .unwrap_or_else(|err| {
                     log::error!("{}", err);
                 });

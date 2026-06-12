@@ -23,6 +23,7 @@ pub trait Renderer<'a>: std::marker::Sized {
         execution: &mut Execution,
         effects: Vec<session::Effect>,
         avg_frametime: &time::Duration,
+        plugins: &mut crate::script::PluginHost,
     ) -> Result<(), Self::Error>;
 
     fn handle_scale_factor_changed(&mut self, scale_factor: f64);

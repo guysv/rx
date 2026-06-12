@@ -70,6 +70,8 @@ impl From<VmError> for ScriptError {
 #[rune(item = ::rx)]
 pub struct Ctx {
     session: *mut Session,
+    /// Draw sink; non-null only during the `draw` hook.
+    draw: *mut crate::draw::Context,
 }
 
 impl Ctx {
@@ -83,6 +85,16 @@ impl Ctx {
     pub fn new(session: &mut Session) -> Self {
         Ctx {
             session: session as *mut Session,
+            draw: std::ptr::null_mut(),
+        }
+    }
+
+    /// A context that can also draw (used by the `draw` hook). Same
+    /// safety contract as [`Ctx::new`], extended to `draw`.
+    pub fn with_draw(session: &mut Session, draw: &mut crate::draw::Context) -> Self {
+        Ctx {
+            session: session as *mut Session,
+            draw: draw as *mut crate::draw::Context,
         }
     }
 
@@ -92,6 +104,14 @@ impl Ctx {
 
     fn session_mut(&mut self) -> &mut Session {
         unsafe { &mut *self.session }
+    }
+
+    fn draw_mut(&mut self) -> Option<&mut crate::draw::Context> {
+        if self.draw.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *self.draw })
+        }
     }
 
     /// Current mode, as a string (e.g. "normal", "visual", "command").
@@ -204,6 +224,49 @@ impl Ctx {
     fn clear_selection(&mut self) {
         self.session_mut().selection = None;
     }
+
+    /// Draw text at `(x, y)` in UI coordinates. Only valid inside the
+    /// `draw` hook; a no-op elsewhere.
+    #[rune::function]
+    fn draw_text(&mut self, text: &str, x: f64, y: f64, color: crate::gfx::color::Rgba8) {
+        use crate::font::TextAlign;
+
+        if let Some(draw) = self.draw_mut() {
+            draw.text_batch.add(
+                text,
+                x as f32,
+                y as f32,
+                crate::draw::UI_LAYER,
+                color,
+                TextAlign::Left,
+            );
+        }
+    }
+
+    /// Draw a 1px line from `p1` to `p2` (`(x, y)` tuples) in UI
+    /// coordinates. Only valid inside the `draw` hook; a no-op elsewhere.
+    #[rune::function]
+    fn draw_line(&mut self, p1: (f64, f64), p2: (f64, f64), color: crate::gfx::color::Rgba8) {
+        use crate::gfx::math::Point2;
+        use crate::gfx::shape2d::Shape;
+
+        if let Some(draw) = self.draw_mut() {
+            draw.ui_batch.add(
+                Shape::line(
+                    Point2::new(p1.0 as f32, p1.1 as f32),
+                    Point2::new(p2.0 as f32, p2.1 as f32),
+                )
+                .stroke(1.0, color)
+                .zdepth(crate::draw::UI_LAYER),
+            );
+        }
+    }
+}
+
+/// Construct a color from RGB components (alpha 255).
+#[rune::function]
+fn rgb(r: i64, g: i64, b: i64) -> crate::gfx::color::Rgba8 {
+    crate::gfx::color::Rgba8::new(r as u8, g as u8, b as u8, 0xff)
 }
 
 /// An immutable snapshot of a view, handed to scripts. Mutation goes
@@ -240,7 +303,11 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::selection)?;
     m.function_meta(Ctx::set_selection)?;
     m.function_meta(Ctx::clear_selection)?;
+    m.function_meta(Ctx::draw_text)?;
+    m.function_meta(Ctx::draw_line)?;
+    m.function_meta(rgb)?;
     m.ty::<ViewInfo>()?;
+    m.ty::<crate::gfx::color::Rgba8>()?;
     Ok(m)
 }
 
@@ -587,6 +654,33 @@ impl PluginHost {
             dispatch!(self, session, "switch_mode", |state, ctx| (state, ctx));
         }
         dispatch!(self, session, "update", |state, ctx| (state, ctx));
+    }
+
+    /// The per-frame `draw` hook: scripts populate the UI batches through
+    /// `rx.draw_text` / `rx.draw_line`.
+    pub fn dispatch_draw(&mut self, session: &mut Session, draw: &mut crate::draw::Context) {
+        for i in 0..self.plugins.len() {
+            {
+                let plugin = &self.plugins[i];
+                if !plugin.enabled || !plugin.script.has_fn("draw") {
+                    continue;
+                }
+            }
+            let state = self.plugins[i].state.clone();
+            let mut ctx = Ctx::with_draw(session, draw);
+            let result = self.plugins[i].script.call("draw", (state, &mut ctx));
+            drop(ctx);
+            if let Err(e) = result {
+                let plugin = &mut self.plugins[i];
+                plugin.enabled = false;
+                log::error!("plugin `{}` draw: {}", plugin.name, e);
+                let name = plugin.name.clone();
+                session.message(
+                    format!("Plugin `{}` disabled: {}", name, first_line(&e)),
+                    crate::session::MessageType::Error,
+                );
+            }
+        }
     }
 
     /// View lifecycle hooks, driven from the session's effects.
@@ -1147,6 +1241,45 @@ mod test {
             1,
             "bad plugin must be disabled"
         );
+    }
+
+    #[test]
+    fn draw_hook_populates_ui_batches() {
+        use crate::draw;
+        use crate::font::TextBatch;
+        use crate::gfx::{shape2d, sprite2d};
+        use crate::sprite;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn draw(state, rx) {
+                rx.draw_text("hi", 10.0, 20.0, rx::rgb(255, 0, 0));
+                rx.draw_line((0.0, 0.0), (50.0, 50.0), rx::rgb(0, 255, 0));
+            }
+            "#,
+        );
+
+        let mut draw_ctx = draw::Context {
+            ui_batch: shape2d::Batch::new(),
+            text_batch: TextBatch::new(96, 208, draw::GLYPH_WIDTH, draw::GLYPH_HEIGHT),
+            overlay_batch: TextBatch::new(96, 208, draw::GLYPH_WIDTH, draw::GLYPH_HEIGHT),
+            cursor_sprite: sprite::Sprite::new(96, 96),
+            tool_batch: sprite2d::Batch::new(96, 96),
+            paste_batch: sprite2d::Batch::new(8, 8),
+            checker_batch: sprite2d::Batch::new(2, 2),
+        };
+        host.dispatch_draw(&mut session, &mut draw_ctx);
+
+        // "hi" = 2 glyphs * 6 vertices.
+        assert_eq!(draw_ctx.text_batch.vertices().len(), 12);
+        // One stroked line = one quad = 6 vertices.
+        assert_eq!(draw_ctx.ui_batch.vertices().len(), 6);
+        // Drawing outside the draw hook is a no-op, not a crash.
+        host.dispatch_update(&mut session);
     }
 
     #[test]

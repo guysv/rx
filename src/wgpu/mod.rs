@@ -1183,6 +1183,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         execution: &mut Execution,
         effects: Vec<session::Effect>,
         avg_frametime: &time::Duration,
+        plugins: &mut crate::script::PluginHost,
     ) -> Result<(), RendererError> {
         if session.state != session::State::Running {
             return Ok(());
@@ -1217,6 +1218,9 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         // Prepare draw context
         self.draw_ctx.clear();
         self.draw_ctx.draw(session, avg_frametime, execution);
+
+        // Script draw hooks add to the UI batches on top of the builtins.
+        plugins.dispatch_draw(session, &mut self.draw_ctx);
 
         let [screen_w, screen_h] = self.screen_texture.size;
         let ortho: M44 = ortho_wgpu(screen_w, screen_h, Origin::TopLeft).into();
