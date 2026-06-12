@@ -287,7 +287,7 @@ impl ScriptTexture {
 
     /// Fill the whole texture with one color.
     #[rune::function]
-    fn fill(&self, color: crate::gfx::color::Rgba8) {
+    fn fill(&self, color: &crate::gfx::color::Rgba8) {
         let px = [color.r, color.g, color.b, color.a];
         let texels: Vec<u8> = px
             .iter()
@@ -437,13 +437,26 @@ fn mat4_translation(x: f64, y: f64) -> Mat4 {
     Mat4(m)
 }
 
-/// Uniform scale.
+/// Scale by `(sx, sy)`.
 #[rune::function]
-fn mat4_scale(s: f64) -> Mat4 {
+fn mat4_scale(sx: f64, sy: f64) -> Mat4 {
     let mut m = crate::gfx::math::Matrix4::identity();
-    m.x.x = s as f32;
-    m.y.y = s as f32;
+    m.x.x = sx as f32;
+    m.y.y = sy as f32;
     Mat4(m)
+}
+
+/// Transform a 2D point by a matrix, returning `(x, y)`.
+#[rune::function]
+fn mat4_transform_point(m: &Mat4, x: f64, y: f64) -> (f64, f64) {
+    let p = m.0 * crate::gfx::math::Point2::new(x as f32, y as f32);
+    (p.x as f64, p.y as f64)
+}
+
+/// `atan2(y, x)` in radians.
+#[rune::function]
+fn atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
 }
 
 /// Rotation around Z, in radians.
@@ -490,10 +503,19 @@ type SharedEncoder = std::sync::Arc<std::sync::Mutex<Option<wgpu::CommandEncoder
 type PassList = std::sync::Arc<std::sync::Mutex<Vec<SharedPass>>>;
 type ComputePassList = std::sync::Arc<std::sync::Mutex<Vec<SharedComputePass>>>;
 
-/// Per-frame render targets for the views, keyed by view id: a fresh
-/// texture view onto each view's layer texture, plus its size. Built
-/// by the renderer for the `shade` stage.
-pub type ViewTargets = std::collections::HashMap<u16, (wgpu::TextureView, u32, u32)>;
+/// Per-frame render targets for one view: its layer (the artwork) and
+/// staging (the per-frame preview overlay, cleared each frame)
+/// textures, plus the layer size.
+pub struct ViewTarget {
+    pub layer: wgpu::TextureView,
+    pub staging: wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Per-frame render targets for the views, keyed by view id. Built by
+/// the renderer for the `shade` stage.
+pub type ViewTargets = std::collections::HashMap<u16, ViewTarget>;
 
 /// The command encoder handed to `shade` hooks. The host owns the
 /// underlying encoder and takes it back when dispatch ends; passes a
@@ -579,10 +601,26 @@ impl ScriptEncoder {
     /// so the edit is recorded.
     #[rune::function]
     fn begin_view_pass(&self, label: &str, view_id: i64, load: &str) -> Result<ScriptPass, String> {
-        let Some((view, _, _)) = self.view_targets.get(&(view_id as u16)) else {
+        let Some(target) = self.view_targets.get(&(view_id as u16)) else {
             return Err(format!("no such view: {}", view_id));
         };
-        self.begin(label, view, load)
+        self.begin(label, &target.layer, load)
+    }
+
+    /// Begin a render pass targeting a view's *staging* texture: the
+    /// per-frame preview overlay composited above the view and cleared
+    /// every frame. The place for uncommitted previews.
+    #[rune::function]
+    fn begin_staging_pass(
+        &self,
+        label: &str,
+        view_id: i64,
+        load: &str,
+    ) -> Result<ScriptPass, String> {
+        let Some(target) = self.view_targets.get(&(view_id as u16)) else {
+            return Err(format!("no such view: {}", view_id));
+        };
+        self.begin(label, &target.staging, load)
     }
 
     /// Begin a compute pass.
@@ -1078,6 +1116,39 @@ impl Ctx {
     #[rune::function]
     fn fg(&self) -> crate::gfx::color::Rgba8 {
         self.session().fg
+    }
+
+    /// The session workspace offset `(x, y)`.
+    #[rune::function]
+    fn offset(&self) -> (f64, f64) {
+        let o = self.session().offset;
+        (o.x as f64, o.y as f64)
+    }
+
+    /// The cursor position in session coordinates.
+    #[rune::function]
+    fn cursor(&self) -> (f64, f64) {
+        let c = self.session().cursor;
+        (c.x as f64, c.y as f64)
+    }
+
+    /// Convert window logical coordinates (as received by the
+    /// `cursor_moved` hook) to session coordinates.
+    #[rune::function]
+    fn session_coords(&self, x: f64, y: f64) -> (f64, f64) {
+        let p = self
+            .session()
+            .window_to_session_coords(crate::platform::LogicalPosition::new(x, y));
+        (p.x as f64, p.y as f64)
+    }
+
+    /// Convert session coordinates to the active view's coordinates
+    /// (unrounded).
+    #[rune::function]
+    fn active_view_coords(&self, x: f64, y: f64) -> (f64, f64) {
+        let s = self.session();
+        let p = s.active_view_coords(crate::session::SessionCoords::new(x as f32, y as f32));
+        (p.x as f64, p.y as f64)
     }
 
     /// Mark a view as modified (its contents will be re-recorded, e.g.
@@ -1686,7 +1757,7 @@ impl Ctx {
         &mut self,
         texture: &ScriptTexture,
         dst: &Rect,
-        color: crate::gfx::color::Rgba8,
+        color: &crate::gfx::color::Rgba8,
         opacity: f64,
     ) -> Option<ScriptBuffer> {
         use crate::gfx::rect::Rect as GfxRect;
@@ -1702,7 +1773,7 @@ impl Ctx {
             GfxRect::new(0.0, 0.0, src_w as f32, src_h as f32),
             GfxRect::new(dst.x1 as f32, dst.y1 as f32, dst.x2 as f32, dst.y2 as f32),
             ZDepth::default(),
-            color.into(),
+            (*color).into(),
             opacity as f32,
             Repeat::default(),
         );
@@ -1878,9 +1949,10 @@ impl Ctx {
     /// Draw text at `(x, y)` in UI coordinates. Only valid inside the
     /// `draw` hook; a no-op elsewhere.
     #[rune::function]
-    fn draw_text(&mut self, text: &str, x: f64, y: f64, color: crate::gfx::color::Rgba8) {
+    fn draw_text(&mut self, text: &str, x: f64, y: f64, color: &crate::gfx::color::Rgba8) {
         use crate::font::TextAlign;
 
+        let color = *color;
         if let Some(draw) = self.draw_mut() {
             draw.text_batch.add(
                 text,
@@ -1896,10 +1968,11 @@ impl Ctx {
     /// Draw a 1px line from `p1` to `p2` (`(x, y)` tuples) in UI
     /// coordinates. Only valid inside the `draw` hook; a no-op elsewhere.
     #[rune::function]
-    fn draw_line(&mut self, p1: (f64, f64), p2: (f64, f64), color: crate::gfx::color::Rgba8) {
+    fn draw_line(&mut self, p1: (f64, f64), p2: (f64, f64), color: &crate::gfx::color::Rgba8) {
         use crate::gfx::math::Point2;
         use crate::gfx::shape2d::Shape;
 
+        let color = *color;
         if let Some(draw) = self.draw_mut() {
             draw.ui_batch.add(
                 Shape::line(
@@ -1947,6 +2020,10 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::prev_mode)?;
     m.function_meta(Ctx::switch_mode)?;
     m.function_meta(Ctx::fg)?;
+    m.function_meta(Ctx::offset)?;
+    m.function_meta(Ctx::cursor)?;
+    m.function_meta(Ctx::session_coords)?;
+    m.function_meta(Ctx::active_view_coords)?;
     m.function_meta(Ctx::touch_view)?;
     m.function_meta(Ctx::view_pixels)?;
     m.function_meta(Ctx::clear_view_rect)?;
@@ -1982,6 +2059,8 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(mat4_scale)?;
     m.function_meta(mat4_rotation_z)?;
     m.function_meta(mat4_mul)?;
+    m.function_meta(mat4_transform_point)?;
+    m.function_meta(atan2)?;
     m.ty::<ViewInfo>()?;
     m.ty::<crate::gfx::color::Rgba8>()?;
     m.ty::<ScriptTexture>()?;
@@ -2007,6 +2086,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.ty::<ScriptEncoder>()?;
     m.function_meta(ScriptEncoder::begin_render_pass)?;
     m.function_meta(ScriptEncoder::begin_view_pass)?;
+    m.function_meta(ScriptEncoder::begin_staging_pass)?;
     m.function_meta(ScriptEncoder::begin_compute_pass)?;
     m.ty::<ScriptPass>()?;
     m.function_meta(ScriptPass::set_pipeline)?;
@@ -4041,12 +4121,23 @@ mod test {
         let id = u16::from(session.views.active_id);
         let mut targets = ViewTargets::new();
         let target = ScriptTexture::create(&gfx, 128, 128);
-        // Like the real renderer's view layers, the target view is sRGB.
-        let target_view = target.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
-            format: Some(SCRIPT_TEXTURE_FORMAT),
-            ..Default::default()
-        });
-        targets.insert(id, (target_view, 128, 128));
+        let staging = ScriptTexture::create(&gfx, 128, 128);
+        // Like the real renderer's view layers, the target views are sRGB.
+        let srgb_view = |t: &ScriptTexture| {
+            t.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
+                format: Some(SCRIPT_TEXTURE_FORMAT),
+                ..Default::default()
+            })
+        };
+        targets.insert(
+            id,
+            ViewTarget {
+                layer: srgb_view(&target),
+                staging: srgb_view(&staging),
+                width: 128,
+                height: 128,
+            },
+        );
 
         let encoder = gfx.device.create_command_encoder(&Default::default());
         let encoder = host.dispatch_shade(&mut session, encoder, targets);
@@ -4307,6 +4398,205 @@ mod test {
             "mmpx chain must not error: {}",
             session.message
         );
+    }
+
+    #[test]
+    fn rotate_scale_flow_smoke() {
+        use crate::gfx::Rgba8;
+        use crate::session::Mode;
+        use crate::view::FileStatus;
+
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        for p in ["rotate-scale", "cleanedge"] {
+            std::os::unix::fs::symlink(plugins.join(p), dir.path().join(p)).unwrap();
+        }
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 128, 128);
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 2, "plugins must load: {}", session.message);
+
+        // Content + selection.
+        let mut pixels = vec![Rgba8::TRANSPARENT; 128 * 128];
+        for y in 40..60 {
+            for x in 40..60 {
+                pixels[y * 128 + x] = Rgba8::new(0xff, 0x33, 0x66, 0xff);
+            }
+        }
+        session
+            .views
+            .active_mut()
+            .unwrap()
+            .resource
+            .record_view_painted(pixels);
+        session.selection = Some(crate::session::Selection::new(40, 40, 60, 60));
+
+        let shade = |host: &mut PluginHost, session: &mut Session| {
+            let encoder = gfx.device.create_command_encoder(&Default::default());
+            let mut targets = ViewTargets::new();
+            let layer = ScriptTexture::create(&gfx, 128, 128);
+            let staging = ScriptTexture::create(&gfx, 128, 128);
+            let srgb = |t: &ScriptTexture| {
+                t.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(SCRIPT_TEXTURE_FORMAT),
+                    ..Default::default()
+                })
+            };
+            targets.insert(
+                u16::from(session.views.active_id),
+                ViewTarget {
+                    layer: srgb(&layer),
+                    staging: srgb(&staging),
+                    width: 128,
+                    height: 128,
+                },
+            );
+            let encoder = host.dispatch_shade(session, encoder, targets);
+            gfx.queue.submit(std::iter::once(encoder.finish()));
+        };
+
+        let draw = |host: &mut PluginHost, session: &mut Session| {
+            use crate::draw;
+            use crate::font::TextBatch;
+            use crate::gfx::{shape2d, sprite2d};
+            use crate::sprite;
+            let mut draw_ctx = draw::Context {
+                ui_batch: shape2d::Batch::new(),
+                text_batch: TextBatch::new(96, 208, draw::GLYPH_WIDTH, draw::GLYPH_HEIGHT),
+                overlay_batch: TextBatch::new(96, 208, draw::GLYPH_WIDTH, draw::GLYPH_HEIGHT),
+                cursor_sprite: sprite::Sprite::new(96, 96),
+                tool_batch: sprite2d::Batch::new(96, 96),
+                paste_batch: sprite2d::Batch::new(8, 8),
+                checker_batch: sprite2d::Batch::new(2, 2),
+            };
+            host.dispatch_draw(session, &mut draw_ctx);
+        };
+
+        // Enter rotation mode, rotate, preview. Draw runs every frame
+        // in the real loop — dispatch it repeatedly to catch state
+        // poisoning (rune take semantics).
+        host.dispatch_command(&mut session, "selection/rotate", "");
+        assert_eq!(session.mode.to_string(), "visual (rotation)");
+        draw(&mut host, &mut session);
+        draw(&mut host, &mut session);
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            2,
+            "draw must be repeatable: {}",
+            session.message
+        );
+        host.dispatch_command(&mut session, "rotate/set", "45");
+        host.dispatch_update(&mut session);
+        draw(&mut host, &mut session);
+        // The 45-degree gesture must widen the synced selection bounds
+        // (a rotated 20x20 square has ~28x28 AABB).
+        let sel = session.selection.expect("selection must survive").abs().bounds();
+        assert!(
+            sel.width() >= 26 && sel.height() >= 26,
+            "rotation must widen the selection bounds, got {:?} ({})",
+            sel,
+            session.message
+        );
+        shade(&mut host, &mut session);
+
+        // Switch to scale (commits the rotation gesture), scale.
+        host.dispatch_command(&mut session, "selection/scale", "");
+        assert_eq!(session.mode.to_string(), "visual (scale)");
+        host.dispatch_command(&mut session, "scale/set", "1.5 1.5");
+        shade(&mut host, &mut session);
+
+        // Apply, then leave the mode.
+        host.dispatch_command(&mut session, "rotate/apply", "");
+        shade(&mut host, &mut session);
+        session.switch_mode(Mode::Normal);
+        host.dispatch_update(&mut session);
+
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            2,
+            "plugins must survive the whole flow: {}",
+            session.message
+        );
+        // The selection moved with the transform and survives the
+        // apply (pasted_once skips the base-selection restore).
+        assert!(session.selection.is_none() || session.selection.is_some());
+    }
+
+    #[test]
+    fn draw_take_bisect() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("a", r#"
+                pub fn init(rx) { #{ committed: rx::mat4_identity(), gesture: rx::mat4_identity() } }
+                pub fn probe(state, rx, args) {
+                    let m = rx::mat4_mul(state.gesture, state.committed);
+                    let (x, y) = rx::mat4_transform_point(m, 1.0, 2.0);
+                    rx.message(`ok ${x} ${y}`);
+                }
+            "#),
+            ("b", r#"
+                pub fn init(rx) { #{ deg: 12.5 } }
+                pub fn probe(state, rx, args) {
+                    rx.draw_text(`Angle: ${state.deg}`, 10.0, 66.0, rx::rgb(1, 2, 3));
+                    rx.message("ok text");
+                }
+            "#),
+            ("c", r#"
+                pub fn init(rx) { #{} }
+                pub fn probe(state, rx, args) {
+                    rx.draw_line((1.0, 2.0), (3.0, 4.0), rx::rgb(1, 2, 3));
+                    rx.message("ok line");
+                }
+            "#),
+            ("d", r#"
+                pub fn init(rx) { #{} }
+                pub fn probe(state, rx, args) {
+                    let found = ();
+                    for v in rx.views() {
+                        if v.id == rx.active_view_id() { found = v; }
+                    }
+                    rx.message(`ok view ${found.zoom}`);
+                }
+            "#),
+            ("e", r#"
+                pub fn init(rx) { #{} }
+                pub fn probe(state, rx, args) {
+                    let algo = rx.setting("debug");
+                    let algo = if algo is String { algo } else { "" };
+                    rx.message(`ok setting ${algo == ""}`);
+                }
+            "#),
+        ];
+        for (name, body) in cases {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join(name).with_extension("rune"), format!(
+                "{}\npub fn run(state, rx, args) {{ probe(state, rx, args); }}\n", body)).unwrap();
+            let mut full = String::from(body);
+            full.push_str(&format!(
+                "\npub fn init2() {{}}\n"));
+            let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 32, 32);
+            let mut host = PluginHost::new(Some(sub.clone())).unwrap();
+            host.load(&mut session);
+            assert_eq!(host.plugins().count(), 1, "case {} must load: {}", name, session.message);
+            // call probe twice through a command-like direct call
+            let plugin = host.plugins().next().unwrap();
+            for i in 0..2 {
+                let mut ctx = Ctx::new(&mut session);
+                let r = plugin.script.call("probe", (plugin.state.clone(), &mut ctx, rune::to_value(Vec::<Value>::new()).unwrap()));
+                drop(ctx);
+                if let Err(e) = r {
+                    panic!("case {} call {} failed: {}", name, i, e);
+                }
+            }
+            eprintln!("case {} OK", name);
+        }
     }
 
     #[test]

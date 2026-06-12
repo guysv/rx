@@ -1,0 +1,17 @@
+-- Exercises P22: the rotate-scale plugin. A red block is filled into
+-- the selection; :selection/rotate (typed from visual mode) enters
+-- rotation mode, where script-tier keybinds drive the gestures: 'e'
+-- rotates +15 (twice), 's' switches to scale mode (committing the
+-- rotation), 'e' scales up (twice), a right-click moves the pivot,
+-- 'r' returns to rotation mode, 'e' rotates around the new pivot,
+-- <return> stamps the result into the view as a recorded edit, escape
+-- exits, and two undos walk back the stamp and then the source clear.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

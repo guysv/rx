@@ -74,9 +74,21 @@ pub enum Event {
 impl From<Event> for String {
     fn from(event: Event) -> String {
         match event {
-            Event::MouseInput(_, platform::InputState::Pressed) => format!("mouse/input pressed"),
-            Event::MouseInput(_, platform::InputState::Released) => format!("mouse/input released"),
-            Event::MouseInput(_, platform::InputState::Repeated) => unreachable!(),
+            Event::MouseInput(button, state) => {
+                let state = match state {
+                    platform::InputState::Pressed => "pressed",
+                    platform::InputState::Released => "released",
+                    platform::InputState::Repeated => unreachable!(),
+                };
+                // The left button stays implicit so existing recordings
+                // round-trip unchanged.
+                match button {
+                    platform::MouseButton::Left => format!("mouse/input {}", state),
+                    platform::MouseButton::Right => format!("mouse/input right {}", state),
+                    platform::MouseButton::Middle => format!("mouse/input middle {}", state),
+                    _ => format!("mouse/input {}", state),
+                }
+            }
             Event::MouseWheel(delta) => format!("mouse/wheel {} {}", delta.x, delta.y),
             Event::CursorMoved(platform::LogicalPosition { x, y }) => {
                 format!("cursor/moved {} {}", x, y)
@@ -107,11 +119,19 @@ impl FromStr for Event {
 
         let result: Result<(Self, &str), Self::Err> = match event.as_str() {
             "mouse/input" => {
+                // Optional button word (right/middle); left is implicit.
+                let (button, p) = if let Some(rest) = p.strip_prefix("right ") {
+                    (platform::MouseButton::Right, rest)
+                } else if let Some(rest) = p.strip_prefix("middle ") {
+                    (platform::MouseButton::Middle, rest)
+                } else {
+                    (platform::MouseButton::Left, p)
+                };
                 let (s, p) = parser::param::<platform::InputState>()
                     .followed_by(end())
                     .parse(p)
                     .map_err(|(e, _)| e)?;
-                Ok((Event::MouseInput(platform::MouseButton::Left, s), p))
+                Ok((Event::MouseInput(button, s), p))
             }
             "mouse/wheel" => {
                 let ((x, y), p) = parser::tuple::<f64>(rational(), rational())

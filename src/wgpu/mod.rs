@@ -1490,11 +1490,12 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             let tex = &vd.layer.texture;
             view_targets.insert(
                 u16::from(*id),
-                (
-                    tex.texture.create_view(&Default::default()),
-                    tex.size[0],
-                    tex.size[1],
-                ),
+                crate::script::ViewTarget {
+                    layer: tex.texture.create_view(&Default::default()),
+                    staging: vd.staging_texture.texture.create_view(&Default::default()),
+                    width: tex.size[0],
+                    height: tex.size[1],
+                },
             );
         }
         let mut encoder = plugins.dispatch_shade(session, encoder, view_targets);

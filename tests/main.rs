@@ -150,6 +150,11 @@ fn rotsprite() {
 }
 
 #[test]
+fn rotate_scale() {
+    test("rotate-scale");
+}
+
+#[test]
 fn source() {
     test("source");
 }
