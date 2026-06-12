@@ -59,6 +59,185 @@ impl From<VmError> for ScriptError {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Gfx
+
+/// The GPU capability handed to scripts: clones of the renderer's
+/// device and queue. wgpu resources are Arc-backed and self-validating,
+/// so sharing them with scripts carries no host invariants
+/// (docs/rune-plan.md, "GPU" section). Attached to the [`PluginHost`]
+/// once the renderer exists, before plugins load.
+pub struct Gfx {
+    pub device: std::sync::Arc<wgpu::Device>,
+    pub queue: std::sync::Arc<wgpu::Queue>,
+}
+
+/// Maximum dimension for script-created textures.
+const MAX_TEXTURE_DIM: i64 = 8192;
+
+/// A script-owned GPU texture (rgba8, render-attachable + bindable).
+///
+/// Owns the underlying wgpu texture: when the plugin's state value is
+/// dropped (unload/reload), the texture is released with it. wgpu
+/// defers the actual destruction past any in-flight frame, so mid-frame
+/// drops are safe.
+#[derive(rune::Any)]
+#[rune(item = ::rx)]
+pub struct ScriptTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Cloned queue handle, so uploads need no further host access.
+    queue: std::sync::Arc<wgpu::Queue>,
+    width: u32,
+    height: u32,
+}
+
+impl ScriptTexture {
+    pub(crate) fn create(gfx: &Gfx, width: u32, height: u32) -> Self {
+        let texture = gfx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("script_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            texture,
+            view,
+            queue: gfx.queue.clone(),
+            width,
+            height,
+        }
+    }
+
+    pub(crate) fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    pub(crate) fn wgpu_texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    fn write(&self, texels: &[u8]) {
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            texels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * self.width),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Texture width in pixels.
+    #[rune::function]
+    fn width(&self) -> i64 {
+        self.width as i64
+    }
+
+    /// Texture height in pixels.
+    #[rune::function]
+    fn height(&self) -> i64 {
+        self.height as i64
+    }
+
+    /// Upload rgba8 pixel data (must be exactly `width * height * 4`
+    /// bytes, row-major). Returns whether the size matched.
+    #[rune::function]
+    fn upload(&self, data: rune::runtime::Bytes) -> bool {
+        if data.len() != (self.width * self.height * 4) as usize {
+            return false;
+        }
+        self.write(&data);
+        true
+    }
+
+    /// Fill the whole texture with one color.
+    #[rune::function]
+    fn fill(&self, color: crate::gfx::color::Rgba8) {
+        let px = [color.r, color.g, color.b, color.a];
+        let texels: Vec<u8> = px
+            .iter()
+            .copied()
+            .cycle()
+            .take((self.width * self.height * 4) as usize)
+            .collect();
+        self.write(&texels);
+    }
+
+    /// Read back the texture contents (blocking; test/debug aid).
+    #[cfg(test)]
+    pub(crate) fn pixels(&self, device: &wgpu::Device) -> Vec<u8> {
+        let (w, h) = (self.width, self.height);
+        let bytes_per_row = (4 * w + 255) & !255;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("script_texture_readback"),
+            size: (bytes_per_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            let start = (y * bytes_per_row) as usize;
+            out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        out
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////
 // Script commands
 
 /// A typed parameter of a script command.
@@ -246,6 +425,8 @@ pub struct Ctx {
     draw: *mut crate::draw::Context,
     /// Command registry; non-null only for calls made by the plugin host.
     cmds: *mut ScriptCommands,
+    /// GPU capability; non-null once the renderer exists.
+    gfx: *const Gfx,
     /// Name of the plugin whose hook is running (owner of registrations).
     plugin: String,
 }
@@ -263,6 +444,7 @@ impl Ctx {
             session: session as *mut Session,
             draw: std::ptr::null_mut(),
             cmds: std::ptr::null_mut(),
+            gfx: std::ptr::null(),
             plugin: String::new(),
         }
     }
@@ -271,10 +453,8 @@ impl Ctx {
     /// safety contract as [`Ctx::new`], extended to `draw`.
     pub fn with_draw(session: &mut Session, draw: &mut crate::draw::Context) -> Self {
         Ctx {
-            session: session as *mut Session,
             draw: draw as *mut crate::draw::Context,
-            cmds: std::ptr::null_mut(),
-            plugin: String::new(),
+            ..Ctx::new(session)
         }
     }
 
@@ -284,6 +464,24 @@ impl Ctx {
         self.cmds = cmds as *mut ScriptCommands;
         self.plugin = plugin.to_string();
         self
+    }
+
+    /// Attach the GPU capability. Unlike the other pointers, `gfx` is
+    /// host-owned and outlives every hook call; the pointer is still
+    /// scoped to one call by construction.
+    pub fn with_gfx(mut self, gfx: Option<&Gfx>) -> Self {
+        if let Some(g) = gfx {
+            self.gfx = g as *const Gfx;
+        }
+        self
+    }
+
+    fn gfx(&self) -> Option<&Gfx> {
+        if self.gfx.is_null() {
+            None
+        } else {
+            Some(unsafe { &*self.gfx })
+        }
     }
 
     fn session(&self) -> &Session {
@@ -528,6 +726,31 @@ impl Ctx {
         }
     }
 
+    /// Create a GPU texture (rgba8, `w`×`h`). The texture belongs to the
+    /// plugin: it is released when the plugin's state is dropped on
+    /// unload/reload. `None` (with a message) if the GPU isn't available
+    /// or the dimensions are invalid.
+    #[rune::function]
+    fn create_texture(&mut self, w: i64, h: i64) -> Option<ScriptTexture> {
+        use crate::session::MessageType;
+
+        let Some(gfx) = self.gfx() else {
+            self.session_mut().message(
+                "Error: the GPU is not available in this context",
+                MessageType::Error,
+            );
+            return None;
+        };
+        if w <= 0 || h <= 0 || w > MAX_TEXTURE_DIM || h > MAX_TEXTURE_DIM {
+            self.session_mut().message(
+                format!("Error: invalid texture size {}x{}", w, h),
+                MessageType::Error,
+            );
+            return None;
+        }
+        Some(ScriptTexture::create(gfx, w as u32, h as u32))
+    }
+
     /// Bind keys in a script mode: `rx.bind(mode, mapping)`. The mode is
     /// a script-mode name prefix; the mapping uses `:map` syntax, e.g.
     /// `"<tab> :v/prev"` or `"'r' :rotate 90 {:rotate 0}"`. The binding
@@ -684,9 +907,15 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::run_builtin)?;
     m.function_meta(Ctx::draw_text)?;
     m.function_meta(Ctx::draw_line)?;
+    m.function_meta(Ctx::create_texture)?;
     m.function_meta(rgb)?;
     m.ty::<ViewInfo>()?;
     m.ty::<crate::gfx::color::Rgba8>()?;
+    m.ty::<ScriptTexture>()?;
+    m.function_meta(ScriptTexture::width)?;
+    m.function_meta(ScriptTexture::height)?;
+    m.function_meta(ScriptTexture::upload)?;
+    m.function_meta(ScriptTexture::fill)?;
     Ok(m)
 }
 
@@ -833,6 +1062,8 @@ pub struct PluginHost {
     plugins: Vec<Plugin>,
     /// Commands registered by plugins (cleared on unload/reload).
     commands: ScriptCommands,
+    /// GPU capability; attached once the renderer exists.
+    gfx: Option<Gfx>,
     dir: Option<std::path::PathBuf>,
     watcher: Option<ReloadWatcher>,
     /// Last mode reported to `switch_mode` hooks (edge detection).
@@ -845,7 +1076,7 @@ pub struct PluginHost {
 /// helper can't express without aliasing the host. `$plugins`/`$cmds`
 /// are the host's fields, split-borrowed by the caller.
 macro_rules! dispatch {
-    ($plugins:expr, $cmds:expr, $session:expr, $hook:expr, |$state:ident, $ctx:ident| $args:tt) => {
+    ($plugins:expr, $cmds:expr, $gfx:expr, $session:expr, $hook:expr, |$state:ident, $ctx:ident| $args:tt) => {
         for i in 0..$plugins.len() {
             {
                 let plugin = &$plugins[i];
@@ -855,7 +1086,9 @@ macro_rules! dispatch {
             }
             let $state = $plugins[i].state.clone();
             let name = $plugins[i].name.clone();
-            let mut ctx = Ctx::new($session).with_commands(&mut *$cmds, &name);
+            let mut ctx = Ctx::new($session)
+                .with_commands(&mut *$cmds, &name)
+                .with_gfx($gfx.as_ref());
             let $ctx = &mut ctx;
             let result = $plugins[i].script.call($hook, $args);
             drop(ctx);
@@ -885,6 +1118,7 @@ impl PluginHost {
             engine,
             plugins: Vec::new(),
             commands: ScriptCommands::default(),
+            gfx: None,
             dir,
             watcher,
             last_mode: None,
@@ -893,6 +1127,22 @@ impl PluginHost {
 
     pub fn plugin_dir(&self) -> Option<&Path> {
         self.dir.as_deref()
+    }
+
+    /// Attach the GPU capability (device + queue clones). Called once
+    /// the renderer exists, before plugins load, so `init` hooks can
+    /// create GPU resources.
+    pub fn attach_gfx(
+        &mut self,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) {
+        self.gfx = Some(Gfx { device, queue });
+    }
+
+    /// The GPU capability, if attached.
+    pub fn gfx(&self) -> Option<&Gfx> {
+        self.gfx.as_ref()
     }
 
     pub fn plugins(&self) -> impl Iterator<Item = &Plugin> {
@@ -947,7 +1197,9 @@ impl PluginHost {
                 }
             };
             let state = {
-                let mut ctx = Ctx::new(session).with_commands(&mut self.commands, &name);
+                let mut ctx = Ctx::new(session)
+                    .with_commands(&mut self.commands, &name)
+                    .with_gfx(self.gfx.as_ref());
                 match script.call("init", (&mut ctx,)) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1021,9 +1273,12 @@ impl PluginHost {
     /// event handling.
     pub fn dispatch_cursor_moved(&mut self, session: &mut Session, x: f64, y: f64) {
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
-        dispatch!(plugins, commands, session, "cursor_moved", |state, ctx| (
+        dispatch!(plugins, commands, gfx, session, "cursor_moved", |state, ctx| (
             state, ctx, x, y
         ));
     }
@@ -1031,9 +1286,12 @@ impl PluginHost {
     /// Mouse button input. Runs before builtin event handling.
     pub fn dispatch_mouse_input(&mut self, session: &mut Session, button: &str, input: &str) {
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
-        dispatch!(plugins, commands, session, "mouse_input", |state, ctx| (
+        dispatch!(plugins, commands, gfx, session, "mouse_input", |state, ctx| (
             state,
             ctx,
             button.to_string(),
@@ -1050,14 +1308,17 @@ impl PluginHost {
             self.last_mode = Some(mode);
         }
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
         if switched {
-            dispatch!(plugins, commands, session, "switch_mode", |state, ctx| (
+            dispatch!(plugins, commands, gfx, session, "switch_mode", |state, ctx| (
                 state, ctx
             ));
         }
-        dispatch!(plugins, commands, session, "update", |state, ctx| (
+        dispatch!(plugins, commands, gfx, session, "update", |state, ctx| (
             state, ctx
         ));
     }
@@ -1114,9 +1375,14 @@ impl PluginHost {
         };
         let state = self.plugins[i].state.clone();
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
-        let mut ctx = Ctx::new(session).with_commands(commands, &plugin_name);
+        let mut ctx = Ctx::new(session)
+            .with_commands(commands, &plugin_name)
+            .with_gfx(gfx.as_ref());
         let result = handler
             .call::<Value>((state, &mut ctx, args))
             .into_result()
@@ -1147,7 +1413,10 @@ impl PluginHost {
     /// `rx.draw_text` / `rx.draw_line`.
     pub fn dispatch_draw(&mut self, session: &mut Session, draw: &mut crate::draw::Context) {
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
         for i in 0..plugins.len() {
             {
@@ -1158,7 +1427,9 @@ impl PluginHost {
             }
             let state = plugins[i].state.clone();
             let name = plugins[i].name.clone();
-            let mut ctx = Ctx::with_draw(session, draw).with_commands(&mut *commands, &name);
+            let mut ctx = Ctx::with_draw(session, draw)
+                .with_commands(&mut *commands, &name)
+                .with_gfx(gfx.as_ref());
             let result = plugins[i].script.call("draw", (state, &mut ctx));
             drop(ctx);
             if let Err(e) = result {
@@ -1179,7 +1450,10 @@ impl PluginHost {
         use crate::session::Effect;
 
         let Self {
-            plugins, commands, ..
+            plugins,
+            commands,
+            gfx,
+            ..
         } = self;
         for effect in effects {
             let (hook, id) = match effect {
@@ -1190,11 +1464,11 @@ impl PluginHost {
             let id = u16::from(id) as i64;
             match hook {
                 "view_added" => {
-                    dispatch!(plugins, commands, session, "view_added", |state, ctx| (
+                    dispatch!(plugins, commands, gfx, session, "view_added", |state, ctx| (
                         state, ctx, id
                     ))
                 }
-                _ => dispatch!(plugins, commands, session, "view_removed", |state, ctx| (
+                _ => dispatch!(plugins, commands, gfx, session, "view_removed", |state, ctx| (
                     state, ctx, id
                 )),
             }
@@ -2217,6 +2491,94 @@ mod test {
             session.message.to_string(),
             "Error: ':boom': plugin `p` is not loaded"
         );
+    }
+
+    /// A headless GPU for texture tests; `None` if no adapter exists.
+    fn test_gfx() -> Option<Gfx> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("test_device"),
+                ..Default::default()
+            },
+            None,
+        ))
+        .ok()?;
+        Some(Gfx {
+            device: std::sync::Arc::new(device),
+            queue: std::sync::Arc::new(queue),
+        })
+    }
+
+    #[test]
+    fn texture_requires_gfx() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                let t = rx.create_texture(8, 8);
+                if t.is_none() { #{} } else { panic!("expected None") }
+            }
+            "#,
+        );
+        assert!(session
+            .message
+            .to_string()
+            .contains("GPU is not available"));
+    }
+
+    #[test]
+    fn texture_create_upload_readback() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                // Invalid sizes are rejected.
+                if rx.create_texture(0, 8).is_some() { panic!("0 accepted"); }
+                if rx.create_texture(8, 9000).is_some() { panic!("9000 accepted"); }
+
+                let t = rx.create_texture(4, 2).unwrap();
+                t.fill(rx::rgb(255, 0, 0));
+
+                // A short upload is rejected; a full one accepted.
+                let bad = t.upload(b"xx");
+                let data = Bytes::new();
+                for i in 0..t.width() * t.height() {
+                    data.extend(b"\x00\xff\x00\xff");
+                }
+                let good = t.upload(data);
+                rx.message(`${t.width()}x${t.height()} ${bad} ${good}`);
+                t
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 1, "fixture plugin must load");
+        assert_eq!(session.message.to_string(), "4x2 false true");
+
+        // Read the texture back through the state value: the upload
+        // (green) must have overwritten the fill (red).
+        let state = host.plugins().next().unwrap().state.clone();
+        let tex = state.borrow_ref::<ScriptTexture>().unwrap();
+        let pixels = tex.pixels(&gfx.device);
+        assert_eq!(pixels.len(), 4 * 2 * 4);
+        for px in pixels.chunks(4) {
+            assert_eq!(px, &[0x00, 0xff, 0x00, 0xff]);
+        }
     }
 
     #[test]
