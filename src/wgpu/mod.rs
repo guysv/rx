@@ -2499,19 +2499,15 @@ impl Renderer {
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((width * height) as usize);
+        let row_bytes = (width * 4) as usize;
+        let mut pixels = vec![Rgba8::default(); (width * height) as usize];
+        let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut pixels);
 
-        for y in 0..height {
-            let row_start = (y * bytes_per_row) as usize;
-            for x in 0..width {
-                let offset = row_start + (x * 4) as usize;
-                pixels.push(Rgba8::new(
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ));
-            }
+        // Copy row-wise to strip the 256-byte row padding (memcpy per row,
+        // fast even in unoptimized builds — this runs once per frame).
+        for y in 0..height as usize {
+            let src = &data[y * bytes_per_row as usize..][..row_bytes];
+            dst[y * row_bytes..][..row_bytes].copy_from_slice(src);
         }
 
         pixels
