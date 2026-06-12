@@ -172,6 +172,19 @@ fn script_params() {
 }
 
 #[test]
+fn script_export() {
+    let png = Path::new("/tmp/rx-script-export.png");
+    fs::remove_file(png).ok();
+    test("script-export");
+
+    // The replay's :ex/save must have written the composited 8x8 PNG
+    // (the digest asserts the message line; this asserts the file).
+    let data = fs::read(png).expect("the export replay writes the png");
+    assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "png signature");
+    assert_eq!(&data[16..24], &[0, 0, 0, 8, 0, 0, 0, 8], "8x8 ihdr");
+}
+
+#[test]
 fn selection_outline() {
     plugin_test("selection-outline");
 }

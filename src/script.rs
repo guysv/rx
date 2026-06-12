@@ -334,8 +334,8 @@ impl ScriptTexture {
         self.write(&texels);
     }
 
-    /// Read back the texture contents (blocking; test/debug aid).
-    #[cfg(test)]
+    /// Read back the texture contents (blocking GPU sync; backs
+    /// `rx.texture_pixels` and the tests).
     pub(crate) fn pixels(&self, device: &wgpu::Device) -> Vec<u8> {
         let (w, h) = (self.width, self.height);
         let bytes_per_row = (4 * w + 255) & !255;
@@ -1485,6 +1485,63 @@ impl Ctx {
         }
     }
 
+    /// Read back a script texture's contents (rgba8 bytes, row-major)
+    /// — the mirror of `upload`. This forces a GPU sync: it is a
+    /// command-handler tool, not a per-frame one. Work recorded by
+    /// `shade`/`render` hooks this frame has not been submitted yet, so
+    /// a readback in the same frame as a mutation sees stale pixels —
+    /// split mutate and read into separate commands a few frames apart
+    /// (the `view_pixels` staleness family).
+    #[rune::function]
+    fn texture_pixels(&mut self, texture: &ScriptTexture) -> Option<rune::runtime::Bytes> {
+        let Some(gfx) = self.gfx() else {
+            self.error("the GPU is not available in this context");
+            return None;
+        };
+        let data = texture.pixels(&gfx.device);
+        rune::runtime::Bytes::from_slice(&data).ok()
+    }
+
+    /// Write rgba8 pixels (row-major, `w`×`h`×4 bytes) to `path` as a
+    /// PNG. The path resolves like builtin `:export` paths — as typed,
+    /// relative to the working directory, *not* plugin-relative. This
+    /// is the scripts' first write capability: success and failure are
+    /// both posted to the message line. Returns whether the write
+    /// succeeded.
+    #[rune::function]
+    fn write_png(&mut self, path: &str, w: i64, h: i64, data: rune::runtime::Bytes) -> bool {
+        use crate::gfx::color::Rgba8;
+        use crate::session::MessageType;
+
+        if w <= 0 || h <= 0 || data.len() != (w * h * 4) as usize {
+            self.error(format!(
+                "write_png: {} bytes for {}x{} (need {})",
+                data.len(),
+                w,
+                h,
+                w.max(0) * h.max(0) * 4
+            ));
+            return false;
+        }
+        let pixels: Vec<Rgba8> = data
+            .chunks_exact(4)
+            .map(|px| Rgba8::new(px[0], px[1], px[2], px[3]))
+            .collect();
+        match crate::image::save_as(path, w as u32, h as u32, 1, &pixels) {
+            Ok(()) => {
+                self.session_mut().message(
+                    format!("\"{}\" {}x{} png written", path, w, h),
+                    MessageType::Info,
+                );
+                true
+            }
+            Err(e) => {
+                self.error(format!("write_png: \"{}\": {}", path, e));
+                false
+            }
+        }
+    }
+
     /// Create a GPU texture (rgba8, `w`×`h`). The texture belongs to the
     /// plugin: it is released when the plugin's state is dropped on
     /// unload/reload. `None` (with a message) if the GPU isn't available
@@ -2203,6 +2260,8 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::draw_text)?;
     m.function_meta(Ctx::draw_line)?;
     m.function_meta(Ctx::create_texture)?;
+    m.function_meta(Ctx::texture_pixels)?;
+    m.function_meta(Ctx::write_png)?;
     m.function_meta(Ctx::read_file)?;
     m.function_meta(Ctx::create_shader)?;
     m.function_meta(Ctx::create_render_pipeline)?;
@@ -4301,6 +4360,53 @@ mod test {
         for px in pixels.chunks(4) {
             assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
         }
+    }
+
+    #[test]
+    fn texture_pixels_roundtrips_upload() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            fn pattern() {
+                let data = Bytes::new();
+                for i in 0..8 {
+                    data.push(i * 16);
+                    data.push(255 - i);
+                    data.push(i);
+                    data.push(255);
+                }
+                data
+            }
+            pub fn init(rx) {
+                let t = rx.create_texture(4, 2).unwrap();
+                t.upload(pattern());
+                let back = rx.texture_pixels(t).unwrap();
+                if back != pattern() {
+                    panic!("roundtrip mismatch");
+                }
+                rx.message(`roundtrip ok ${back.len()}`);
+                #{}
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().count(),
+            1,
+            "fixture plugin must load: {}",
+            session.message
+        );
+        assert_eq!(session.message.to_string(), "roundtrip ok 32");
     }
 
     #[test]
