@@ -5,6 +5,14 @@ takes the P35+ numbering; the parked easymetric plan (stashed, was P35–P41)
 renumbers when revived — and lands better for the wait, since its
 "per-layer geometry" maps onto real layers.
 
+**Out of scope: persistence.** Frames set the precedent — rx has no
+frame manifest either: a save writes the sheet PNG as-is and `:slice`
+reinterprets it on load. Layers inherit exactly that posture: `:w`
+writes the sheet (layers stacked vertically, frames horizontally — a
+valid PNG everywhere), and reinterpreting a tall sheet on load is the
+user's move, not a format's. A manifest/flatten-on-export design is
+deliberately unplanned; if it ever happens it's its own document.
+
 The design is **layers as vertical strips of the view sheet**, exactly as
 frames are horizontal strips: one texture per view, sheet height grows to
 `fh × nlayers`, the workspace displays the strips composited in place, and
@@ -182,25 +190,9 @@ resize-with-pixels edit, one undo step.
   3-layer view matches the composite the screen showed (probe via
   eyedropper messages).
 
-### Part K — persistence & the script tier
+### Part K — the script tier
 
-**P39. Persistence.**
-Save writes the sheet — the PNG *is* the layered master, layers stacked
-vertically, degrading gracefully in foreign tools — plus a small
-manifest (layer count, names, visibility, opacity) in a PNG `tEXt`
-chunk (verify the png encoder exposes chunk writing at implementation
-time; fallback: a sidecar `.toml`, same schema). Load reads the
-manifest; absent manifest → one layer, today's behavior.
-`:layer/slice <n>` reinterprets a tall sheet as n layers — the `slice`
-precedent (`src/cmd.rs:822`) — so any stacked PNG is importable with
-zero format support. `:export` flattens: CPU composite from the current
-snapshot honoring visibility/opacity; gif export composites per frame.
-`:w` keeps writing the sheet.
-- Test: replay save → close → load roundtrip (file checked by the
-  harness, the `lt/export` P26 pattern) with layer attrs surviving;
-  `:layer/slice` on a fixture PNG; export-flattens digest probe.
-
-**P40. The script API tier.**
+**P39. The script API tier.**
 `ViewInfo` grows `layers` and `active_layer` (the P27 pattern: expose
 what `View` has). Routed-compat semantics made contractual and
 documented: `view_pixels`/`clear_view_rect` rects stay display-space,
@@ -224,7 +216,7 @@ detection edge-wise. `docs/script-api.md` gains the layers section.
   A derived, never-recorded composite texture per view (recomposited
   when dirty) is the fix — defer-by-measurement until a plugin actually
   needs to sample a layered view as-seen. Document the limitation in
-  P40 meanwhile.
+  P39 meanwhile.
 - **Blend modes.** The composite is currently fixed alpha-over quads.
   Modes (multiply, screen, …) would move compositing into a shader —
   deliberately out of Part J/K; the quad path doesn't foreclose it.
@@ -254,7 +246,7 @@ detection edge-wise. `docs/script-api.md` gains the layers section.
 | Erase = Constant blend + transparent | `src/session.rs:1028-1051`, `:1992-1996` |
 | ViewExtent (grow in P35) | `src/view.rs:50-90` |
 | Frame lifecycle to mirror (P36) | `src/view.rs:252-283` (`extend`/`shrink`/`extend_clone`), `src/cmd.rs:993-1006`, `src/session.rs:2773-2800` |
-| Slice precedent for `:layer/slice` (P39) | `src/view.rs:320`, `src/cmd.rs:822` |
+| Slice precedent (if layer reinterpretation is ever wanted) | `src/view.rs:320`, `src/cmd.rs:822` |
 | Per-frame display quads (stack in P36) | `src/draw.rs:733-748`, buffers `src/wgpu/mod.rs:2389-2427`; anim preview `src/draw.rs:720-731` |
 | ViewData / staging texture (size split, P35) | `src/wgpu/mod.rs:408-436` |
 | Staging/final passes (quad order, P37) | `src/wgpu/mod.rs:1349-1485` |
@@ -263,5 +255,5 @@ detection edge-wise. `docs/script-api.md` gains the layers section.
 | Eyedropper (composite walk, P37) | `src/session.rs:1223-1230` |
 | SelectionJump + stale layers TODO (P37) | `src/session.rs:3060-3073` |
 | Hit test / display rect | `src/view.rs:370-382`, `src/session.rs:1215-1221` |
-| Script touchpoints (P40) | `src/script.rs:1334` (`view_pixels`), `:656-676` (passes), `:687` (`view_bind_group`) |
+| Script touchpoints (P39) | `src/script.rs:1334` (`view_pixels`), `:656-676` (passes), `:687` (`view_bind_group`) |
 | Modified-indicator via EditId (survives as-is) | `src/view/resource.rs:36-46` |
