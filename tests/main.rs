@@ -28,9 +28,9 @@ struct AssetConfig {
 }
 
 lazy_static! {
-    /// This mutex is here to prevent certain tests from running
-    /// in parallel. This is due to the fact that we spawn windows
-    /// and graphics contexts which are not thread-safe.
+    /// Windowed (glfw) runs spawn real windows and graphics contexts,
+    /// which are not thread-safe, so they are serialized. Headless runs
+    /// are surface-less and can run in parallel.
     pub static ref MUTEX: Mutex<()> = Mutex::new(());
 }
 
@@ -128,9 +128,12 @@ fn test(name: &str) {
 }
 
 fn run(name: &str) -> io::Result<()> {
-    // We allow tests to create these temporary files,
-    // so make sure it's not there when a test is run.
-    fs::remove_file("/tmp/rx.png").ok();
+    // The `saving` test writes and re-opens this file; make sure it's
+    // not there when the test runs. Scoped to `saving` so concurrent
+    // tests don't delete it mid-run.
+    if name == "saving" {
+        fs::remove_file("/tmp/rx.png").ok();
+    }
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -158,7 +161,11 @@ fn run(name: &str) -> io::Result<()> {
     };
 
     {
-        let _guard = MUTEX.lock();
+        let _guard = if cfg!(feature = "glfw") {
+            Some(MUTEX.lock())
+        } else {
+            None
+        };
         rx::init::<&str>(&[], options)
     }
 }
