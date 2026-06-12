@@ -100,6 +100,11 @@ fn grid() {
 }
 
 #[test]
+fn flood() {
+    test("flood");
+}
+
+#[test]
 fn source() {
     test("source");
 }
