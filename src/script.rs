@@ -241,6 +241,164 @@ impl fmt::Debug for CompiledScript {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Plugin host
+
+/// A loaded plugin: compiled script + the state value its `init` returned.
+pub struct Plugin {
+    pub name: String,
+    script: CompiledScript,
+    state: Value,
+}
+
+/// Owns all plugins. Lives outside [`Session`] so hooks can borrow the
+/// session mutably while the host borrows itself.
+pub struct PluginHost {
+    engine: ScriptEngine,
+    plugins: Vec<Plugin>,
+    dir: Option<std::path::PathBuf>,
+    watcher: Option<ReloadWatcher>,
+}
+
+impl PluginHost {
+    /// A host rooted at the given plugin directory (`None` = no plugins).
+    pub fn new(dir: Option<std::path::PathBuf>) -> Result<Self, ScriptError> {
+        let engine = ScriptEngine::new()?;
+        let watcher = match &dir {
+            Some(d) if d.is_dir() => ReloadWatcher::new(d).ok(),
+            _ => None,
+        };
+        Ok(Self {
+            engine,
+            plugins: Vec::new(),
+            dir,
+            watcher,
+        })
+    }
+
+    pub fn plugin_dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    pub fn plugins(&self) -> impl Iterator<Item = &Plugin> {
+        self.plugins.iter()
+    }
+
+    /// Discover plugin entry points: `<dir>/<name>.rune` files and
+    /// `<dir>/<name>/<name>.rune` packages, in lexicographic order.
+    fn discover(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
+        let mut found = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return found,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    let entry_point = path.join(name).with_extension("rune");
+                    if entry_point.is_file() {
+                        found.push((name.to_string(), entry_point));
+                    }
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rune") {
+                if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
+                    found.push((stem.to_string(), path.clone()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Load (or re-load) all plugins from the plugin dir. A plugin that
+    /// fails to compile or whose `init` errors is reported to the message
+    /// line and skipped; it never affects its siblings.
+    pub fn load(&mut self, session: &mut Session) {
+        let dir = match &self.dir {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        for (name, path) in Self::discover(&dir) {
+            let script = match self.engine.compile_path(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("plugin `{}`: {}", name, e);
+                    session.message(
+                        format!("Error loading plugin `{}`: {}", name, first_line(&e)),
+                        crate::session::MessageType::Error,
+                    );
+                    continue;
+                }
+            };
+            let state = {
+                let mut ctx = Ctx::new(session);
+                match script.call("init", (&mut ctx,)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("plugin `{}` init: {}", name, e);
+                        session.message(
+                            format!("Error initializing plugin `{}`: {}", name, first_line(&e)),
+                            crate::session::MessageType::Error,
+                        );
+                        continue;
+                    }
+                }
+            };
+            log::info!("plugin `{}` loaded from {}", name, path.display());
+            self.plugins.push(Plugin {
+                name,
+                script,
+                state,
+            });
+        }
+    }
+
+    /// Call `unload` on every plugin that defines it, then drop them all.
+    pub fn unload(&mut self, session: &mut Session) {
+        for plugin in self.plugins.drain(..) {
+            let mut ctx = Ctx::new(session);
+            match plugin
+                .script
+                .call("unload", (plugin.state.clone(), &mut ctx))
+            {
+                Ok(_) | Err(ScriptError::MissingFn(_)) => {}
+                Err(e) => {
+                    log::error!("plugin `{}` unload: {}", plugin.name, e);
+                }
+            }
+        }
+    }
+
+    /// Reload all plugins if the watcher saw a change. Returns whether a
+    /// reload happened.
+    pub fn reload_if_changed(&mut self, session: &mut Session) -> bool {
+        if self.watcher.as_ref().is_some_and(|w| w.changed()) {
+            self.reload(session);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unconditional reload: unload everything and load fresh.
+    pub fn reload(&mut self, session: &mut Session) {
+        self.unload(session);
+        self.load(session);
+        session.message("Plugins reloaded", crate::session::MessageType::Execution);
+    }
+}
+
+/// First line of an error display, for the one-line message bar.
+fn first_line(e: &ScriptError) -> String {
+    let s = e.to_string();
+    s.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+////////////////////////////////////////////////////////////////////////////
 // Hot reload
 
 /// Watches a directory and reports (debounced) whether anything changed.
@@ -429,6 +587,85 @@ mod test {
             Err(ScriptError::Vm(_)) => {}
             other => panic!("expected Vm error, got: {:?}", other.map(|_| ())),
         }
+    }
+
+    fn write_plugin(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name).with_extension("rune"), body).unwrap();
+    }
+
+    #[test]
+    fn host_loads_plugins_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Flat file plugin.
+        write_plugin(
+            dir.path(),
+            "alpha",
+            r#"pub fn init(rx) { rx.message("alpha up"); #{} }"#,
+        );
+        // Directory-package plugin.
+        std::fs::create_dir(dir.path().join("beta")).unwrap();
+        write_plugin(
+            &dir.path().join("beta"),
+            "beta",
+            r#"pub fn init(rx) { rx.message("beta up"); #{} }"#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+
+        let names: Vec<_> = host.plugins().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        // beta loaded last; its message is the visible one.
+        assert_eq!(session.message.to_string(), "beta up");
+    }
+
+    #[test]
+    fn broken_plugin_does_not_block_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(dir.path(), "broken", "pub fn init(rx) { let }");
+        write_plugin(
+            dir.path(),
+            "crashy",
+            r#"pub fn init(rx) { None.unwrap() }"#,
+        );
+        write_plugin(dir.path(), "good", r#"pub fn init(rx) { #{} }"#);
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+
+        let names: Vec<_> = host.plugins().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["good"]);
+    }
+
+    #[test]
+    fn unload_hook_runs_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn unload(state, rx) { rx.message("p unloaded"); }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 1);
+
+        // Change the plugin and force a reload: unload runs, new code lands.
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"pub fn init(rx) { rx.message("p v2"); #{} }"#,
+        );
+        host.reload(&mut session);
+        assert_eq!(host.plugins().count(), 1);
+        // The reload banner is posted last; v2's init ran before it.
+        assert_eq!(session.message.to_string(), "Plugins reloaded");
     }
 
     #[test]

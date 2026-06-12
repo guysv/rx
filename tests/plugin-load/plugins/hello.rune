@@ -1,0 +1,6 @@
+// Fixture plugin: proves plugin loading is digest-visible via the
+// message line (ui/message stays on in this test's setup).
+pub fn init(rx) {
+    rx.message("hello plugin loaded");
+    #{}
+}

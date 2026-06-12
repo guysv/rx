@@ -105,6 +105,11 @@ fn flood() {
 }
 
 #[test]
+fn plugin_load() {
+    test("plugin-load");
+}
+
+#[test]
 fn source() {
     test("source");
 }
@@ -154,10 +159,14 @@ fn run(name: &str) -> io::Result<()> {
 
     let glyphs = glyphs.as_slice();
 
+    // Tests with a `plugins/` subdirectory get those plugins loaded.
+    let plugin_dir = Some(path.join("plugins")).filter(|p| p.is_dir());
+
     let options = rx::Options {
         resizable: false,
         headless: true,
         source: Some(path.join(name).with_extension("rx")),
+        plugin_dir,
         width: cfg.window.width,
         height: cfg.window.height,
         exec: ExecutionMode::Replay(path.clone(), DigestMode::Verify),
