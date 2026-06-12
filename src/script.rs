@@ -1154,6 +1154,12 @@ impl Ctx {
         self.session().fg
     }
 
+    /// The background color.
+    #[rune::function]
+    fn bg(&self) -> crate::gfx::color::Rgba8 {
+        self.session().bg
+    }
+
     /// Set the foreground color, with the picker's semantics: the old
     /// foreground becomes the background; transparent is ignored.
     /// color, and no builtin command does.
@@ -2295,6 +2301,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::switch_mode)?;
     m.function_meta(Ctx::fg)?;
     m.function_meta(Ctx::set_fg)?;
+    m.function_meta(Ctx::bg)?;
     m.function_meta(Ctx::offset)?;
     m.function_meta(Ctx::screen_size)?;
     m.function_meta(Ctx::cursor)?;
