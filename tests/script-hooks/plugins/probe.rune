@@ -1,0 +1,51 @@
+// Fixture plugin: input and lifecycle hooks. Accumulates what the host
+// dispatched (cursor moves, mouse buttons, mode edges) and reports it
+// on demand — both via its own command and via an export that the
+// sibling `caller` plugin reaches through call_plugin.
+pub fn init(rx) {
+    rx.export("summary", summary);
+    rx.register_command("hooks/report", [], "Report hook activity", report);
+    #{ moves: 0, last: (0.0, 0.0), mouse: [], modes: [], updated: false }
+}
+
+pub fn cursor_moved(state, rx, x, y) {
+    state.moves += 1;
+    state.last = (x, y);
+}
+
+pub fn mouse_input(state, rx, button, input) {
+    state.mouse.push(`${button}/${input}`);
+}
+
+pub fn switch_mode(state, rx) {
+    state.modes.push(rx.mode());
+}
+
+pub fn update(state, rx) {
+    // Fires every frame: keep it a flag, a count would change the
+    // rendered message (and thus the digest) on every frame.
+    state.updated = true;
+}
+
+fn line(state) {
+    let (x, y) = state.last;
+    let mouse = "";
+    for m in state.mouse {
+        if mouse != "" { mouse += ","; }
+        mouse += m;
+    }
+    let modes = "";
+    for m in state.modes {
+        if modes != "" { modes += ">"; }
+        modes += m;
+    }
+    `moves=${state.moves} last=${x},${y} mouse=${mouse} modes=${modes} updated=${state.updated}`
+}
+
+pub fn summary(state, rx, args) {
+    line(state)
+}
+
+pub fn report(state, rx, args) {
+    rx.message(line(state));
+}

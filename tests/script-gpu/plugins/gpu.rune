@@ -1,0 +1,104 @@
+// Fixture plugin: the GPU scripting API end-to-end. `gpu/stamp` runs a
+// compute pass (invert a red/green checker to cyan/magenta), copies the
+// result through a texture-target render pass, then stamps it into the
+// view layer at 4x — recorded via touch_view, so undo removes it.
+// `gpu/preview` toggles a staging-pass overlay of the source checker,
+// repainted every frame (staging clears per frame).
+pub fn init(rx) {
+    let wgsl = rx.read_file("gpu.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let render = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+    let compute = rx.create_compute_pipeline(shader, "cs_invert").unwrap();
+
+    // 8x8 source: fill() red, then upload() a red/green checker over it
+    // (the upload must win over the fill).
+    let src = rx.create_texture(8, 8).unwrap();
+    src.fill(rx::rgb(0, 0, 255));
+    let data = Bytes::new();
+    for i in 0..64 {
+        if (i % 8 + i / 8) % 2 == 0 {
+            data.extend(b"\xff\x00\x00\xff");
+        } else {
+            data.extend(b"\x00\xff\x00\xff");
+        }
+    }
+    src.upload(data);
+
+    let out = rx.create_texture(8, 8).unwrap(); // compute output
+    let mid = rx.create_texture(8, 8).unwrap(); // render-pass intermediate
+    let cbg = rx.create_compute_bind_group(src, out).unwrap();
+
+    rx.register_command("gpu/stamp", [], "Stamp the inverted checker into the view", stamp);
+    rx.register_command("gpu/preview", [], "Toggle the staging preview", preview);
+    rx.register_command("gpu/check", [], "Read back stamped pixels", check);
+    #{ render, compute, src, out, mid, cbg, pending: false, preview: false }
+}
+
+pub fn stamp(state, rx, args) {
+    state.pending = true;
+    rx.touch_view(rx.active_view_id());
+}
+
+pub fn preview(state, rx, args) {
+    state.preview = !state.preview;
+}
+
+// Reads two texel blocks of the stamped area back from the recorded
+// snapshot: adjacent checker cells, so after the stamp one is the
+// inversion of red and the other of green; after undo both are the
+// white fill again.
+pub fn check(state, rx, args) {
+    let id = rx.active_view_id();
+    let a = rx.view_pixels(id, rx::rect(33.0, 33.0, 34.0, 34.0)).unwrap();
+    let b = rx.view_pixels(id, rx::rect(37.0, 33.0, 38.0, 34.0)).unwrap();
+    rx.message(`check a=${a[0]},${a[1]},${a[2]},${a[3]} b=${b[0]},${b[1]},${b[2]},${b[3]}`);
+}
+
+fn quad(rx, pass, pipeline, texture, dst, w, h) {
+    let tbg = rx.create_transform_bind_group(w, h, rx::mat4_identity()).unwrap();
+    let sbg = rx.create_texture_bind_group(texture).unwrap();
+    let v = rx.create_sprite_vertices(texture, dst, rx::rgb(255, 255, 255), 1.0).unwrap();
+    pass.set_pipeline(pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+}
+
+pub fn shade(state, rx, encoder) {
+    let id = rx.active_view_id();
+    let view = None;
+    for v in rx.views() {
+        if v.id == id {
+            view = Some(v);
+        }
+    }
+    let view = view.unwrap();
+
+    if state.pending {
+        state.pending = false;
+
+        // 1. Compute: invert src -> out (red/green -> cyan/magenta).
+        let cpass = encoder.begin_compute_pass("invert").unwrap();
+        cpass.set_pipeline(state.compute).unwrap();
+        cpass.set_bind_group(0, state.cbg).unwrap();
+        cpass.dispatch(1, 1, 1).unwrap();
+        cpass.end();
+
+        // 2. Render pass to a texture target: copy out -> mid.
+        let p1 = encoder.begin_render_pass("to-mid", state.mid, "clear").unwrap();
+        quad(rx, p1, state.render, state.out, rx::rect(0.0, 0.0, 8.0, 8.0), 8, 8);
+        p1.end();
+
+        // 3. View pass: stamp mid into the view layer at 4x.
+        let p2 = encoder.begin_view_pass("stamp", id, "load").unwrap();
+        quad(rx, p2, state.render, state.mid, rx::rect(32.0, 32.0, 64.0, 64.0), view.width, view.height);
+        p2.end();
+    }
+
+    if state.preview {
+        let p3 = encoder.begin_staging_pass("preview", id, "clear").unwrap();
+        quad(rx, p3, state.render, state.src, rx::rect(0.0, 0.0, 16.0, 16.0), view.width, view.height);
+        p3.end();
+    }
+}

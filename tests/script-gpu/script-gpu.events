@@ -1,0 +1,68 @@
+00000 0000000 cursor/moved 639 359
+00010 0000100 char/received ':'
+00020 0000200 char/received 'g'
+00030 0000300 char/received 'p'
+00040 0000400 char/received 'u'
+00050 0000500 char/received '/'
+00060 0000600 char/received 's'
+00070 0000700 char/received 't'
+00080 0000800 char/received 'a'
+00090 0000900 char/received 'm'
+00100 0001000 char/received 'p'
+00110 0001100 keyboard/input <return> pressed
+00115 0001150 keyboard/input <return> released
+00150 0001500 char/received ':'
+00160 0001600 char/received 'g'
+00170 0001700 char/received 'p'
+00180 0001800 char/received 'u'
+00190 0001900 char/received '/'
+00200 0002000 char/received 'c'
+00210 0002100 char/received 'h'
+00220 0002200 char/received 'e'
+00230 0002300 char/received 'c'
+00240 0002400 char/received 'k'
+00250 0002500 keyboard/input <return> pressed
+00255 0002550 keyboard/input <return> released
+00290 0002900 char/received ':'
+00300 0003000 char/received 'g'
+00310 0003100 char/received 'p'
+00320 0003200 char/received 'u'
+00330 0003300 char/received '/'
+00340 0003400 char/received 'p'
+00350 0003500 char/received 'r'
+00360 0003600 char/received 'e'
+00370 0003700 char/received 'v'
+00380 0003800 char/received 'i'
+00390 0003900 char/received 'e'
+00400 0004000 char/received 'w'
+00410 0004100 keyboard/input <return> pressed
+00415 0004150 keyboard/input <return> released
+00450 0004500 char/received ':'
+00460 0004600 char/received 'g'
+00470 0004700 char/received 'p'
+00480 0004800 char/received 'u'
+00490 0004900 char/received '/'
+00500 0005000 char/received 'p'
+00510 0005100 char/received 'r'
+00520 0005200 char/received 'e'
+00530 0005300 char/received 'v'
+00540 0005400 char/received 'i'
+00550 0005500 char/received 'e'
+00560 0005600 char/received 'w'
+00570 0005700 keyboard/input <return> pressed
+00575 0005750 keyboard/input <return> released
+00610 0006100 keyboard/input u pressed
+00615 0006150 keyboard/input u released
+00650 0006500 char/received ':'
+00660 0006600 char/received 'g'
+00670 0006700 char/received 'p'
+00680 0006800 char/received 'u'
+00690 0006900 char/received '/'
+00700 0007000 char/received 'c'
+00710 0007100 char/received 'h'
+00720 0007200 char/received 'e'
+00730 0007300 char/received 'c'
+00740 0007400 char/received 'k'
+00750 0007500 keyboard/input <return> pressed
+00755 0007550 keyboard/input <return> released
+00790 0007900 cursor/moved 640 360

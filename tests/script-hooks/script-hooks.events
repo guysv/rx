@@ -1,0 +1,20 @@
+00000 0000000 cursor/moved 100 100
+00010 0000100 cursor/moved 120 110
+00045 0000450 keyboard/input 1 pressed
+00050 0000500 keyboard/input 1 released
+00085 0000850 mouse/input pressed
+00095 0000950 mouse/input released
+00105 0001050 mouse/input right pressed
+00115 0001150 mouse/input right released
+00150 0001500 keyboard/input v pressed
+00155 0001550 keyboard/input v released
+00190 0001900 keyboard/input <esc> pressed
+00195 0001950 keyboard/input <esc> released
+00230 0002300 keyboard/input 1 pressed
+00235 0002350 keyboard/input 1 released
+00270 0002700 keyboard/input 2 pressed
+00275 0002750 keyboard/input 2 released
+00310 0003100 cursor/moved 121 111
+00345 0003450 keyboard/input 1 pressed
+00350 0003500 keyboard/input 1 released
+00385 0003850 cursor/moved 122 112
