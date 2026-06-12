@@ -439,6 +439,11 @@ type SharedPass = std::sync::Arc<std::sync::Mutex<Option<wgpu::RenderPass<'stati
 type SharedEncoder = std::sync::Arc<std::sync::Mutex<Option<wgpu::CommandEncoder>>>;
 type PassList = std::sync::Arc<std::sync::Mutex<Vec<SharedPass>>>;
 
+/// Per-frame render targets for the views, keyed by view id: a fresh
+/// texture view onto each view's layer texture, plus its size. Built
+/// by the renderer for the `shade` stage.
+pub type ViewTargets = std::collections::HashMap<u16, (wgpu::TextureView, u32, u32)>;
+
 /// The command encoder handed to `shade` hooks. The host owns the
 /// underlying encoder and takes it back when dispatch ends; passes a
 /// hook leaves open are force-ended after the call, so a stored
@@ -449,16 +454,14 @@ type PassList = std::sync::Arc<std::sync::Mutex<Vec<SharedPass>>>;
 pub struct ScriptEncoder {
     enc: SharedEncoder,
     passes: PassList,
+    view_targets: std::sync::Arc<ViewTargets>,
 }
 
 impl ScriptEncoder {
-    /// Begin a render pass targeting a script texture. `load` is
-    /// `"load"` (keep contents) or `"clear"` (clear to transparent).
-    #[rune::function]
-    fn begin_render_pass(
+    fn begin(
         &self,
         label: &str,
-        target: &ScriptTexture,
+        target: &wgpu::TextureView,
         load: &str,
     ) -> Result<ScriptPass, String> {
         let load = match load {
@@ -474,7 +477,7 @@ impl ScriptEncoder {
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target.view(),
+                    view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load,
@@ -487,8 +490,34 @@ impl ScriptEncoder {
             })
             .forget_lifetime();
         let shared: SharedPass = std::sync::Arc::new(std::sync::Mutex::new(Some(pass)));
-        self.passes.lock().expect("pass list lock").push(shared.clone());
+        self.passes
+            .lock()
+            .expect("pass list lock")
+            .push(shared.clone());
         Ok(ScriptPass { pass: shared })
+    }
+
+    /// Begin a render pass targeting a script texture. `load` is
+    /// `"load"` (keep contents) or `"clear"` (clear to transparent).
+    #[rune::function]
+    fn begin_render_pass(
+        &self,
+        label: &str,
+        target: &ScriptTexture,
+        load: &str,
+    ) -> Result<ScriptPass, String> {
+        self.begin(label, target.view(), load)
+    }
+
+    /// Begin a render pass targeting a view's layer texture. Painting
+    /// into a view this way should be followed by `rx.touch_view(id)`
+    /// so the edit is recorded.
+    #[rune::function]
+    fn begin_view_pass(&self, label: &str, view_id: i64, load: &str) -> Result<ScriptPass, String> {
+        let Some((view, _, _)) = self.view_targets.get(&(view_id as u16)) else {
+            return Err(format!("no such view: {}", view_id));
+        };
+        self.begin(label, view, load)
     }
 }
 
@@ -870,6 +899,51 @@ impl Ctx {
     #[rune::function]
     fn active_view_id(&self) -> i64 {
         u16::from(self.session().views.active_id) as i64
+    }
+
+    /// The foreground color.
+    #[rune::function]
+    fn fg(&self) -> crate::gfx::color::Rgba8 {
+        self.session().fg
+    }
+
+    /// Mark a view as modified (its contents will be re-recorded, e.g.
+    /// after a script render pass painted into it).
+    #[rune::function]
+    fn touch_view(&mut self, id: i64) {
+        use crate::view::ViewId;
+
+        if let Some(v) = self.session_mut().views.get_mut(ViewId::from(id as u16)) {
+            v.touch();
+        }
+    }
+
+    /// Read a view's pixels in the given rect (rgba8 bytes, row-major).
+    /// The rect is clamped to the view; `None` if the view doesn't
+    /// exist or the rect is empty.
+    #[rune::function]
+    fn view_pixels(&mut self, id: i64, rect: &Rect) -> Option<rune::runtime::Bytes> {
+        use crate::gfx::rect::Rect as GfxRect;
+        use crate::view::ViewId;
+
+        let session = self.session();
+        let v = session.views.get(ViewId::from(id as u16))?;
+        let r = GfxRect::new(
+            rect.x1.min(rect.x2) as i32,
+            rect.y1.min(rect.y2) as i32,
+            rect.x1.max(rect.x2) as i32,
+            rect.y1.max(rect.y2) as i32,
+        );
+        if !r.intersects(v.layer_bounds()) {
+            return None;
+        }
+        let r = r.intersection(v.layer_bounds());
+        let (_, pixels) = v.resource.layer.get_snapshot_rect(&r)?;
+        let mut bytes = Vec::with_capacity(pixels.len() * 4);
+        for px in &pixels {
+            bytes.extend_from_slice(&[px.r, px.g, px.b, px.a]);
+        }
+        rune::runtime::Bytes::from_slice(&bytes).ok()
     }
 
     /// Snapshots of all views, in view order.
@@ -1481,6 +1555,9 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::mode)?;
     m.function_meta(Ctx::prev_mode)?;
     m.function_meta(Ctx::switch_mode)?;
+    m.function_meta(Ctx::fg)?;
+    m.function_meta(Ctx::touch_view)?;
+    m.function_meta(Ctx::view_pixels)?;
     m.function_meta(Ctx::message)?;
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
@@ -1525,6 +1602,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.ty::<Rect>()?;
     m.ty::<ScriptEncoder>()?;
     m.function_meta(ScriptEncoder::begin_render_pass)?;
+    m.function_meta(ScriptEncoder::begin_view_pass)?;
     m.ty::<ScriptPass>()?;
     m.function_meta(ScriptPass::set_pipeline)?;
     m.function_meta(ScriptPass::set_bind_group)?;
@@ -2034,8 +2112,10 @@ impl PluginHost {
         &mut self,
         session: &mut Session,
         encoder: wgpu::CommandEncoder,
+        view_targets: ViewTargets,
     ) -> wgpu::CommandEncoder {
         let shared: SharedEncoder = std::sync::Arc::new(std::sync::Mutex::new(Some(encoder)));
+        let view_targets = std::sync::Arc::new(view_targets);
         let Self {
             plugins,
             commands,
@@ -2056,6 +2136,7 @@ impl PluginHost {
             let enc = ScriptEncoder {
                 enc: shared.clone(),
                 passes: passes.clone(),
+                view_targets: view_targets.clone(),
             };
 
             if let Some(g) = gfx.as_ref() {
@@ -3398,7 +3479,7 @@ mod test {
         assert_eq!(host.plugins().count(), 1, "fixture plugin must load");
 
         let encoder = gfx.device.create_command_encoder(&Default::default());
-        let encoder = host.dispatch_shade(&mut session, encoder);
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
         gfx.queue.submit(std::iter::once(encoder.finish()));
 
         assert_eq!(
@@ -3463,18 +3544,86 @@ mod test {
         // First frame: the plugin leaves the pass open and stores it;
         // the host force-ends it, so the encoder still finishes.
         let encoder = gfx.device.create_command_encoder(&Default::default());
-        let encoder = host.dispatch_shade(&mut session, encoder);
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
         gfx.queue.submit(std::iter::once(encoder.finish()));
         assert_eq!(host.plugins().filter(|p| p.enabled).count(), 1);
 
         // Second frame: using the stored pass is a clean error.
         let encoder = gfx.device.create_command_encoder(&Default::default());
-        let encoder = host.dispatch_shade(&mut session, encoder);
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
         gfx.queue.submit(std::iter::once(encoder.finish()));
         assert_eq!(
             session.message.to_string(),
             "pass error: the render pass has ended"
         );
+    }
+
+    #[test]
+    fn selection_outline_plugin_smoke() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 128, 128);
+        let mut host = PluginHost::new(Some(dir)).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert!(
+            host.plugins().any(|p| p.name == "selection-outline" && p.enabled),
+            "plugin must load: {}",
+            session.message
+        );
+
+        // Give the view CPU-side content: a white block on transparency.
+        use crate::gfx::Rgba8;
+        let mut pixels = vec![Rgba8::TRANSPARENT; 128 * 128];
+        for y in 60..65 {
+            for x in 56..73 {
+                pixels[y * 128 + x] = Rgba8::new(0xff, 0xff, 0xff, 0xff);
+            }
+        }
+        session
+            .views
+            .active_mut()
+            .unwrap()
+            .resource
+            .record_view_painted(pixels);
+
+        session.selection = Some(crate::session::Selection::new(40, 40, 90, 90));
+        host.dispatch_command(&mut session, "selection/outline", "");
+        assert!(
+            !session.message.to_string().starts_with("Error")
+                && !session.message.to_string().contains("disabled"),
+            "command must succeed: {}",
+            session.message
+        );
+
+        let id = u16::from(session.views.active_id);
+        let mut targets = ViewTargets::new();
+        let target = ScriptTexture::create(&gfx, 128, 128);
+        targets.insert(id, (target.wgpu_texture().create_view(&Default::default()), 128, 128));
+
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, targets);
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert!(
+            host.plugins().filter(|p| p.name == "selection-outline").all(|p| p.enabled),
+            "plugin must survive shade: {}",
+            session.message
+        );
+
+        // The outline ring must be painted around the block's alpha
+        // boundary in the foreground color (default white).
+        let out = target.pixels(&gfx.device);
+        let px = |x: usize, y: usize| {
+            let i = (y * 128 + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        assert_eq!(px(55, 60), [0xff, 0xff, 0xff, 0xff], "left of block must be outlined");
+        assert_eq!(px(64, 59), [0xff, 0xff, 0xff, 0xff], "above block must be outlined");
+        assert_eq!(px(64, 62), [0, 0, 0, 0], "block interior must not be painted");
+        assert_eq!(px(20, 20), [0, 0, 0, 0], "far field must stay clear");
     }
 
     #[test]

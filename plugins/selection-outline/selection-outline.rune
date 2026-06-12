@@ -1,0 +1,67 @@
+// selection-outline: draws a foreground-color outline around the
+// alpha boundary of the current selection's contents (Rune port of
+// selection-outline.rxx; the WGSL is unchanged from master).
+
+pub fn init(rx) {
+    let wgsl = rx.read_file("selection-outline.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+
+    rx.register_command("selection/outline", [], "Outline the selection", outline);
+
+    #{ pipeline, pending: None }
+}
+
+pub fn outline(state, rx, args) {
+    let sel = rx.selection();
+    if sel.is_none() {
+        return;
+    }
+    let (x1, y1, x2, y2) = sel.unwrap();
+    let view_id = rx.active_view_id();
+
+    // Snapshot the selection's pixels into a texture sized to it.
+    let r = rx::rect(x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+    let pixels = rx.view_pixels(view_id, r);
+    if pixels.is_none() {
+        return;
+    }
+    let w = if x2 > x1 { x2 - x1 } else { x1 - x2 };
+    let h = if y2 > y1 { y2 - y1 } else { y1 - y2 };
+    let clipboard = rx.create_texture(w, h).unwrap();
+    clipboard.upload(pixels.unwrap());
+
+    state.pending = Some(#{ view_id, clipboard, dst: r });
+    rx.touch_view(view_id);
+}
+
+pub fn shade(state, rx, encoder) {
+    if state.pending.is_none() {
+        return;
+    }
+    let job = state.pending.unwrap();
+    state.pending = None;
+
+    let views = rx.views();
+    let target = None;
+    for v in views {
+        if v.id == job.view_id {
+            target = Some(v);
+        }
+    }
+    if target.is_none() {
+        return;
+    }
+    let view = target.unwrap();
+
+    let tbg = rx.create_transform_bind_group(view.width, view.height, rx::mat4_identity()).unwrap();
+    let sbg = rx.create_texture_bind_group(job.clipboard).unwrap();
+    let verts = rx.create_sprite_vertices(job.clipboard, job.dst, rx.fg(), 1.0).unwrap();
+
+    let pass = encoder.begin_view_pass("selection-outline", job.view_id, "load").unwrap();
+    pass.set_pipeline(state.pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, verts).unwrap();
+    pass.draw(verts.count(), 1).unwrap();
+}

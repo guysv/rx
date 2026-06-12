@@ -130,6 +130,11 @@ fn script_bind() {
 }
 
 #[test]
+fn selection_outline() {
+    test("selection-outline");
+}
+
+#[test]
 fn source() {
     test("source");
 }

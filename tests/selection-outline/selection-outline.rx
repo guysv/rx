@@ -1,0 +1,14 @@
+-- Exercises P16: the selection-outline plugin. The canvas is filled
+-- white, a hole is erased (a recorded edit with an alpha boundary),
+-- then :selection/outline paints a foreground-colored ring along the
+-- hole's rim. Undo removes the ring (the script paint is recorded),
+-- proving the round-trip.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff
