@@ -22,9 +22,13 @@ use std::str::FromStr;
 )]
 #[rune(item = ::rx)]
 pub struct Rgba8 {
+    #[rune(get)]
     pub r: u8,
+    #[rune(get)]
     pub g: u8,
+    #[rune(get)]
     pub b: u8,
+    #[rune(get)]
     pub a: u8,
 }
 
