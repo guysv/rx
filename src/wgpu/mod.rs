@@ -1482,6 +1482,10 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             }
         }
 
+        // Script `shade` stage: plugins record their own passes after
+        // view content, before screen composition.
+        let mut encoder = plugins.dispatch_shade(session, encoder);
+
         // Render to screen framebuffer
         {
             let bg = Rgba::from(session.settings["background"].to_rgba8());
