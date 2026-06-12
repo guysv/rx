@@ -1,0 +1,17 @@
+00000 0000010 cursor/moved 100 100
+00025 0000260 char/received ':'
+00030 0000310 char/received 'p'
+00035 0000360 char/received 'r'
+00040 0000410 char/received '/'
+00045 0000460 char/received 't'
+00050 0000510 char/received 'i'
+00055 0000560 char/received 'n'
+00060 0000610 char/received 't'
+00065 0000660 char/received ' '
+00070 0000710 char/received '1'
+00075 0000760 char/received ' '
+00080 0000810 char/received '0'
+00085 0000860 char/received ' '
+00090 0000910 char/received '0'
+00095 0000960 keyboard/input <return> pressed
+00100 0001010 keyboard/input <return> released

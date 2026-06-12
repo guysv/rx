@@ -1,0 +1,12 @@
+-- Exercises P25: script uniforms. The fixture plugin draws a quad
+-- whose shader tints by a user param (group 0, binding 1); :pr/tint
+-- changes the param on a command — the two tints are digest-distinct.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

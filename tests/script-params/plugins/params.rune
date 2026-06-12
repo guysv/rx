@@ -1,0 +1,38 @@
+// Fixture plugin: P25 script uniforms. A white quad is tinted by a
+// user param (group 0, binding 1) every frame; :pr/tint r g b changes
+// the tint from plugin state.
+pub fn init(rx) {
+    let wgsl = rx.read_file("params.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
+    let tex = rx.create_texture(8, 8).unwrap();
+    tex.fill(rx::rgb(255, 255, 255));
+    rx.register_command("pr/tint", ["float", "float", "float"], "Set the tint param", tint);
+    #{ pipeline, tex, r: 0.0, g: 1.0, b: 0.0 }
+}
+
+pub fn tint(state, rx, args) {
+    state.r = args[0];
+    state.g = args[1];
+    state.b = args[2];
+}
+
+pub fn render(state, rx, pass) {
+    let (w, h) = rx.screen_size();
+    let tbg = rx.create_transform_params_bind_group(
+        w, h, rx::mat4_identity(),
+        [state.r, state.g, state.b, 1.0],
+    ).unwrap();
+    let sbg = rx.create_texture_bind_group(state.tex).unwrap();
+    let v = rx.create_sprite_vertices(
+        state.tex,
+        rx::rect(60.0, 500.0, 124.0, 564.0),
+        rx::rgb(255, 255, 255),
+        1.0,
+    ).unwrap();
+    pass.set_pipeline(state.pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+}
