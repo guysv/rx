@@ -1500,28 +1500,32 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         }
         let mut encoder = plugins.dispatch_shade(session, encoder, view_targets);
 
-        // Render to screen framebuffer
-        {
+        // Render to screen framebuffer. The pass is handed to the
+        // script `render` stage at the end of the block (lifetime
+        // erased so the encoder stays movable for the hand-off).
+        let screen_pass = {
             let bg = Rgba::from(session.settings["background"].to_rgba8());
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("screen_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.screen_texture.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg.r as f64,
-                            g: bg.g as f64,
-                            b: bg.b as f64,
-                            a: bg.a as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("screen_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.screen_texture.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: bg.r as f64,
+                                g: bg.g as f64,
+                                b: bg.b as f64,
+                                a: bg.a as f64,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
 
             // Draw checkers if enabled
             if session.settings["checker"].is_set() {
@@ -1743,7 +1747,15 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                     pass.draw(0..count, 0..1);
                 }
             }
-        }
+
+            pass
+        };
+
+        // Script `render` stage: the live screen pass — everything
+        // drawn, before present — handed to each plugin's `render`
+        // hook for screen-space drawing.
+        let mut encoder =
+            plugins.dispatch_render(session, encoder, screen_pass, &self.screen_texture.view);
 
         // Render screen to surface (final pass). Skipped surface-less: cursor and
         // overlay only ever hit the swapchain, so digests are unaffected.

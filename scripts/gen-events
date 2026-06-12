@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Generate a replay .events file from a simple action script (stdin).
+
+Actions, one per line (blank lines and #-comments skipped):
+
+    move <x> <y>          cursor/moved
+    press <key>           keyboard press+release (e.g. press <return>)
+    down <key>            keyboard press only
+    up <key>              keyboard release only
+    click [button]        mouse press+release (left if omitted)
+    mousedown [button]    mouse press only
+    mouseup [button]      mouse release only
+    char <c>              one char/received
+    type <text>           char/received per character
+    cmd <text>            ':' + text + <return>  (command-line entry)
+    wait <frames>         advance the clock
+
+Frames advance a few ticks per event (10ms/frame), matching the
+hand-written recordings. See CLAUDE.md "Hand-writing .events".
+"""
+import sys
+
+frame = 0
+ms = 10
+
+
+def emit(event, step=5):
+    global frame, ms
+    print(f"{frame:05d} {ms:07d} {event}")
+    frame += step
+    ms += step * 10
+
+
+def key(name):
+    emit(f"keyboard/input {name} pressed")
+    emit(f"keyboard/input {name} released")
+
+
+def chars(text):
+    for c in text:
+        emit(f"char/received '{c}'")
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    op, _, arg = line.partition(" ")
+    arg = arg.strip()
+    if op == "move":
+        emit(f"cursor/moved {arg}")
+    elif op == "press":
+        key(arg)
+    elif op == "down":
+        emit(f"keyboard/input {arg} pressed")
+    elif op == "up":
+        emit(f"keyboard/input {arg} released")
+    elif op == "click":
+        emit(f"mouse/input {arg} pressed".replace("  ", " ") if arg else "mouse/input pressed")
+        emit(f"mouse/input {arg} released".replace("  ", " ") if arg else "mouse/input released")
+    elif op == "mousedown":
+        emit(f"mouse/input {arg} pressed" if arg else "mouse/input pressed")
+    elif op == "mouseup":
+        emit(f"mouse/input {arg} released" if arg else "mouse/input released")
+    elif op == "char":
+        chars(arg)
+    elif op == "type":
+        chars(arg)
+    elif op == "cmd":
+        chars(":" + arg)
+        key("<return>")
+    elif op == "wait":
+        n = int(arg)
+        frame += n
+        ms += n * 10
+    else:
+        sys.exit(f"unknown action: {line}")

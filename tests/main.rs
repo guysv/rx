@@ -157,6 +157,11 @@ fn script_gpu() {
 }
 
 #[test]
+fn script_render() {
+    test("script-render");
+}
+
+#[test]
 fn selection_outline() {
     plugin_test("selection-outline");
 }

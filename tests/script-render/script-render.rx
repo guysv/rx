@@ -1,0 +1,15 @@
+-- Exercises P23: the `render` stage. A fixture plugin draws two
+-- textured quads onto the live screen pass every frame: one pinned to
+-- a session coordinate (composing rx.offset()), one pinned to a screen
+-- coordinate. Panning the workspace must move the session quad with
+-- the view while the screen quad stays put — both placements are
+-- digest-visible.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

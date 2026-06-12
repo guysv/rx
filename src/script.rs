@@ -1125,6 +1125,16 @@ impl Ctx {
         (o.x as f64, o.y as f64)
     }
 
+    /// The screen size `(w, h)` in session pixels — the size of the
+    /// `render` stage's target. Build screen-space orthos against it
+    /// (`create_transform_bind_group(w, h, ...)`); compose `rx.offset()`
+    /// and view zoom into the transform for session-space placement.
+    #[rune::function]
+    fn screen_size(&self) -> (i64, i64) {
+        let s = self.session();
+        (s.width as i64, s.height as i64)
+    }
+
     /// The cursor position in session coordinates.
     #[rune::function]
     fn cursor(&self) -> (f64, f64) {
@@ -2024,6 +2034,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::switch_mode)?;
     m.function_meta(Ctx::fg)?;
     m.function_meta(Ctx::offset)?;
+    m.function_meta(Ctx::screen_size)?;
     m.function_meta(Ctx::cursor)?;
     m.function_meta(Ctx::session_coords)?;
     m.function_meta(Ctx::active_view_coords)?;
@@ -2688,6 +2699,130 @@ impl PluginHost {
             .take()
             .expect("the host always gets the frame encoder back");
         encoder
+    }
+
+    /// The `render` stage: the live screen pass — everything drawn, the
+    /// present still ahead — handed to each plugin's
+    /// `render(state, rx, pass)` hook for screen-space drawing.
+    ///
+    /// The host owns the pass round-trip. Pass validation in wgpu only
+    /// surfaces when the pass *ends*, so to attribute errors to the
+    /// plugin that recorded them, each hook gets the pass in its own
+    /// `Arc` and the host ends it inside that hook's validation error
+    /// scope, beginning a fresh load-pass over the screen for the next
+    /// hook (pass boundaries are invisible: load + store). A kept
+    /// handle errors cleanly. A GPU error disables the plugin and
+    /// poisons the encoder — the host swaps in a fresh one so later
+    /// plugins and the present still run (the frame's earlier recording
+    /// is lost, the frame itself is not — the next frame re-renders
+    /// everything).
+    pub fn dispatch_render(
+        &mut self,
+        session: &mut Session,
+        encoder: wgpu::CommandEncoder,
+        pass: wgpu::RenderPass<'static>,
+        screen: &wgpu::TextureView,
+    ) -> wgpu::CommandEncoder {
+        let mut pass = Some(pass);
+        let mut encoder = Some(encoder);
+        let Self {
+            plugins,
+            commands,
+            gfx,
+            ..
+        } = self;
+
+        // Continuation pass: load whatever the screen holds, never clear.
+        let begin_screen_pass = |encoder: &mut wgpu::CommandEncoder| {
+            encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("script_render_stage"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: screen,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime()
+        };
+
+        for i in 0..plugins.len() {
+            {
+                let plugin = &plugins[i];
+                if !plugin.enabled || !plugin.script.has_fn("render") {
+                    continue;
+                }
+            }
+            let state = plugins[i].state.clone();
+            let name = plugins[i].name.clone();
+
+            if let Some(g) = gfx.as_ref() {
+                g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            }
+            let live = match pass.take() {
+                Some(p) => p,
+                None => {
+                    begin_screen_pass(encoder.as_mut().expect("the host holds the encoder"))
+                }
+            };
+            let shared: SharedPass = std::sync::Arc::new(std::sync::Mutex::new(Some(live)));
+            let script_pass = ScriptPass {
+                pass: shared.clone(),
+            };
+            let mut ctx = Ctx::new(session)
+                .with_commands(&mut *commands, &name)
+                .with_gfx(gfx.as_ref())
+                .with_root(Some(plugins[i].root.clone()));
+            let result = plugins[i]
+                .script
+                .call("render", (state, &mut ctx, script_pass));
+            drop(ctx);
+
+            // End the pass while this hook's error scope is still
+            // pushed: recording errors validate at pass end, and they
+            // must land on the plugin that recorded them. The Arc is
+            // dead from here on — a kept handle errors cleanly.
+            shared.lock().expect("pass lock").take();
+            let gpu_error = gfx.as_ref().and_then(|g| g.pop_error());
+
+            if gpu_error.is_some() {
+                // The encoder is poisoned: swap in a fresh one. The
+                // next hook (or no one) begins a fresh screen pass.
+                if let Some(g) = gfx.as_ref() {
+                    encoder = Some(g.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("render_encoder"),
+                        },
+                    ));
+                }
+            }
+
+            let error = match (result, gpu_error) {
+                (Err(e), _) => Some(first_line(&e)),
+                (Ok(_), Some(e)) => Some(flatten_error(&e.to_string())),
+                (Ok(_), None) => None,
+            };
+            if let Some(e) = error {
+                let plugin = &mut plugins[i];
+                plugin.enabled = false;
+                log::error!("plugin `{}` render: {}", plugin.name, e);
+                let name = plugin.name.clone();
+                session.message(
+                    format!("Plugin `{}` disabled: {}", name, e),
+                    crate::session::MessageType::Error,
+                );
+            }
+        }
+
+        // End the host's pass if no hook consumed it.
+        pass.take();
+        encoder.take().expect("the host always gets the frame encoder back")
     }
 
     /// Whether a registered script command repeats on key-hold.
@@ -4019,6 +4154,205 @@ mod test {
             .unwrap();
         let target = target.borrow_ref::<ScriptTexture>().unwrap();
         let pixels = target.pixels(&gfx.device);
+        for px in pixels.chunks(4) {
+            assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
+        }
+    }
+
+    #[test]
+    fn render_stage_draws_to_screen() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.wgsl"), TEST_WGSL).unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                let wgsl = rx.read_file("test.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+                let source = rx.create_texture(4, 4).unwrap();
+                source.fill(rx::rgb(0, 0, 255));
+                let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
+                let sbg = rx.create_texture_bind_group(source).unwrap();
+                let verts = rx.create_sprite_vertices(
+                    source,
+                    rx::rect(0.0, 0.0, 4.0, 4.0),
+                    rx::rgb(255, 255, 255),
+                    1.0,
+                ).unwrap();
+                #{ pipeline, tbg, sbg, verts, kept: None }
+            }
+            pub fn render(state, rx, pass) {
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_bind_group(1, state.sbg).unwrap();
+                pass.set_vertex_buffer(0, state.verts).unwrap();
+                pass.draw(state.verts.count(), 1).unwrap();
+                state.kept = Some(pass);
+            }
+            pub fn poke(state, rx) {
+                // The host ended the pass after the hook returned; a
+                // kept handle errors cleanly.
+                match state.kept.unwrap().draw(6, 1) {
+                    Err(e) => rx.message(`kept: ${e}`),
+                    Ok(_) => rx.message("kept: unexpectedly alive"),
+                }
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 1, "fixture plugin must load");
+
+        // Host-side stand-in for the screen: a texture-target pass.
+        let screen = ScriptTexture::create(&gfx, 4, 4);
+        let mut encoder = gfx.device.create_command_encoder(&Default::default());
+        let pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("screen_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen.view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            })
+            .forget_lifetime();
+        let encoder = host.dispatch_render(&mut session, encoder, pass, screen.view());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive the render dispatch: {}",
+            session.message
+        );
+
+        // The hook must have painted the screen blue.
+        let pixels = screen.pixels(&gfx.device);
+        for px in pixels.chunks(4) {
+            assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
+        }
+
+        // The pass handle the hook kept must error cleanly now.
+        let plugin = host.plugins().next().unwrap();
+        let mut ctx = Ctx::new(&mut session);
+        plugin
+            .script
+            .call("poke", (plugin.state.clone(), &mut ctx))
+            .unwrap();
+        drop(ctx);
+        assert_eq!(
+            session.message.to_string(),
+            "kept: the render pass has ended"
+        );
+    }
+
+    #[test]
+    fn render_stage_gpu_error_disables_plugin() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.wgsl"), TEST_WGSL).unwrap();
+        // `a` records an invalid draw (no pipeline bound): a GPU
+        // validation error that poisons the encoder. `b` (running
+        // after) must still get a live pass and draw.
+        write_plugin(
+            dir.path(),
+            "a",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn render(state, rx, pass) {
+                pass.draw(3, 1).unwrap();
+            }
+            "#,
+        );
+        write_plugin(
+            dir.path(),
+            "b",
+            r#"
+            pub fn init(rx) {
+                let wgsl = rx.read_file("test.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+                let source = rx.create_texture(4, 4).unwrap();
+                source.fill(rx::rgb(0, 0, 255));
+                let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
+                let sbg = rx.create_texture_bind_group(source).unwrap();
+                let verts = rx.create_sprite_vertices(
+                    source,
+                    rx::rect(0.0, 0.0, 4.0, 4.0),
+                    rx::rgb(255, 255, 255),
+                    1.0,
+                ).unwrap();
+                #{ pipeline, tbg, sbg, verts }
+            }
+            pub fn render(state, rx, pass) {
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_bind_group(1, state.sbg).unwrap();
+                pass.set_vertex_buffer(0, state.verts).unwrap();
+                pass.draw(state.verts.count(), 1).unwrap();
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 2, "fixture plugins must load");
+
+        let screen = ScriptTexture::create(&gfx, 4, 4);
+        let mut encoder = gfx.device.create_command_encoder(&Default::default());
+        let pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("screen_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: screen.view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            })
+            .forget_lifetime();
+        let encoder = host.dispatch_render(&mut session, encoder, pass, screen.view());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+
+        let enabled: Vec<&str> = host
+            .plugins()
+            .filter(|p| p.enabled)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["b"], "a disabled, b alive: {}", session.message);
+        assert!(
+            session.message.to_string().contains("Plugin `a` disabled"),
+            "got: {}",
+            session.message
+        );
+
+        // `b` drew on the continuation pass.
+        let pixels = screen.pixels(&gfx.device);
         for px in pixels.chunks(4) {
             assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
         }
