@@ -8,6 +8,38 @@ the API surface a plugin system needs, discovered over ~60 commits of
 dogfooding. This time the API is built against that spec, in an order that
 avoids the retrofits the first iteration needed.
 
+## Status: complete
+
+All phases (P4–P22) have landed, one commit per phase, each ending
+green. The open questions below were resolved in their phases:
+
+- **Rune version**: 0.14.2. Two engine quirks shaped the API: function
+  arity is capped at 5 slots including the receiver (multi-arg calls
+  take vectors or refs), and `FromValue` on a by-value `Any` argument
+  *takes* the value — so reusable arguments (colors, matrices) pass by
+  reference, and long-lived plugin state avoids `Option` (P22).
+- **Ctx growth**: flat methods on `rx`, picked at P5 and kept.
+- **GPU misuse policy** (P15/P21): every GPU-stage hook runs in a
+  validation error scope; a GPU error disables the plugin with a
+  one-line message and the host swaps in a fresh encoder (a poisoned
+  encoder must not kill the frame). Passes auto-end when a new one
+  begins and are force-ended at hook return; a kept pass errors
+  cleanly. Device/queue handles are attached before plugins load, so
+  all hooks (including `init`) can create GPU resources.
+- **Meta-plugin mechanism** (P20): registry. The import route was
+  prototyped and is a dead end — a Rune function value cannot execute
+  on another unit's VM. `rx.export` / `rx.call_plugin` are
+  host-mediated; the callee runs on its own unit with its own state.
+- **Mid-frame GPU destruction** (P14): wgpu already defers destruction
+  past in-flight frames; ownership is by value (textures die with the
+  plugin state on reload), no registry needed.
+- **User-batch `Rc` sharing** (P9): gone — `draw` hooks take `&mut`
+  to the draw context through `Ctx`, no shared cells.
+
+wgpu note: the plan assumed wgpu 23 resources were `Clone`; that's
+24+. The renderer Arc-wraps `Device`/`Queue` instead — revisit on the
+next wgpu upgrade.
+
 ## Where the branch stands (phases 1–3, done)
 
 - wgpu port + engine-neutral fixes cherry-picked from `master`; renderer is
