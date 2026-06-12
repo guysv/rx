@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rune::runtime::{RuntimeContext, VmError};
-use rune::{Context, Diagnostics, Hash, Source, Sources, Unit, Value, Vm};
+use rune::{Context, Diagnostics, Source, Sources, Unit, Value, Vm};
 
 use crate::session::Session;
 
@@ -370,6 +370,65 @@ mod test {
         let v = script.call("bump", (state,)).unwrap();
         let n: i64 = rune::from_value(v).unwrap();
         assert_eq!(n, 2, "state mutations must persist across calls");
+    }
+
+    /// A bare headless session for script tests.
+    pub(crate) fn test_session() -> Session {
+        let proj_dirs = directories::ProjectDirs::from("io", "cloudhead", "rx").unwrap();
+        let base_dirs = directories::BaseDirs::new().unwrap();
+        Session::new(640, 480, std::env::temp_dir(), proj_dirs, base_dirs)
+    }
+
+    #[test]
+    fn ctx_reads_and_mutates_session() {
+        let mut session = test_session();
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn init(rx) {
+                    rx.message("hello from rune");
+                    rx.mode()
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("init", (&mut ctx,)).unwrap();
+        drop(ctx);
+
+        let mode: String = rune::from_value(v).unwrap();
+        assert_eq!(mode, "normal");
+        assert_eq!(session.message.to_string(), "hello from rune");
+    }
+
+    #[test]
+    fn stored_ctx_is_revoked_after_the_call() {
+        let mut session = test_session();
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                struct State { rx }
+                pub fn init(rx) { State { rx } }
+                pub fn later(state) { state.rx.mode() }
+                "#,
+            )
+            .unwrap();
+
+        let state = {
+            let mut ctx = Ctx::new(&mut session);
+            script.call("init", (&mut ctx,)).unwrap()
+        };
+        // The guard was revoked when `init` returned; using the smuggled
+        // ctx must be a clean runtime error, not a dangling-pointer deref.
+        match script.call("later", (state,)) {
+            Err(ScriptError::Vm(_)) => {}
+            other => panic!("expected Vm error, got: {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]
