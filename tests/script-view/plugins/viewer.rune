@@ -1,0 +1,55 @@
+// Fixture plugin: view and selection APIs. Each command posts its
+// observation to the message line; `vw/cut` also leaves a visible
+// transparent hole in the white fill. Pixel readback happens in a
+// separate command (`vw/px`) because view_pixels reads the recorded
+// snapshot, which only includes the clear once that edit's frame
+// has been recorded.
+pub fn init(rx) {
+    rx.register_command("vw/sel", [], "Set and read back the selection", sel);
+    rx.register_command("vw/cut", [], "Clear the selected rect", cut);
+    rx.register_command("vw/px", [], "Read pixels in and out of the hole", px);
+    rx.register_command("vw/info", [], "Report view info", info);
+    rx.register_command("vw/coords", [], "Report coordinate conversions", coords);
+    rx.register_command("vw/damage", [], "Damage and touch the view", damage);
+    #{}
+}
+
+pub fn sel(state, rx, args) {
+    rx.set_selection(2, 2, 10, 10);
+    let (x1, y1, x2, y2) = rx.selection().unwrap();
+    rx.message(`sel ${x1},${y1} ${x2},${y2}`);
+}
+
+pub fn cut(state, rx, args) {
+    let (x1, y1, x2, y2) = rx.selection().unwrap();
+    rx.clear_view_rect(rx::rect(x1 as f64, y1 as f64, x2 as f64, y2 as f64));
+    rx.clear_selection();
+    rx.message(`cut cleared=${rx.selection().is_none()}`);
+}
+
+pub fn px(state, rx, args) {
+    let id = rx.active_view_id();
+    let hole = rx.view_pixels(id, rx::rect(4.0, 4.0, 5.0, 5.0)).unwrap();
+    let solid = rx.view_pixels(id, rx::rect(20.0, 20.0, 21.0, 21.0)).unwrap();
+    rx.message(`px hole=${hole[0]},${hole[1]},${hole[2]},${hole[3]} solid=${solid[0]},${solid[1]},${solid[2]},${solid[3]}`);
+}
+
+pub fn info(state, rx, args) {
+    let views = rx.views();
+    let v = views[0];
+    let (ox, oy) = rx.offset();
+    rx.message(`info n=${views.len()} id=${rx.active_view_id()} ${v.width}x${v.height} zoom=${v.zoom} offset=${ox},${oy}`);
+}
+
+pub fn coords(state, rx, args) {
+    let (sx, sy) = rx.session_coords(639.0, 359.0);
+    let (vx, vy) = rx.active_view_coords(sx, sy);
+    rx.message(`coords session=${sx},${sy} view=${vx},${vy}`);
+}
+
+pub fn damage(state, rx, args) {
+    let id = rx.active_view_id();
+    rx.damage_view(id);
+    rx.touch_view(id);
+    rx.message("damaged");
+}

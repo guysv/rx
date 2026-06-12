@@ -1,0 +1,15 @@
+-- Exercises plugin-declared settings: declare_setting defaults,
+-- set_setting round-trip and type rejection, and the builtin `:set`
+-- against plugin settings. The message line stays on: reports are the
+-- digest-visible state. Settings can't be touched here — this file is
+-- sourced before plugins load — so keys are mapped instead.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+map 1 :prefs/report
+map 2 :prefs/tweak

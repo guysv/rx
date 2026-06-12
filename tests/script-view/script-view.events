@@ -1,0 +1,14 @@
+00000 0000000 cursor/moved 639 359
+00010 0000100 keyboard/input 1 pressed
+00015 0000150 keyboard/input 1 released
+00050 0000500 keyboard/input 2 pressed
+00055 0000550 keyboard/input 2 released
+00090 0000900 keyboard/input 3 pressed
+00095 0000950 keyboard/input 3 released
+00130 0001300 keyboard/input 4 pressed
+00135 0001350 keyboard/input 4 released
+00170 0001700 keyboard/input 5 pressed
+00175 0001750 keyboard/input 5 released
+00210 0002100 keyboard/input 6 pressed
+00215 0002150 keyboard/input 6 released
+00250 0002500 cursor/moved 640 360

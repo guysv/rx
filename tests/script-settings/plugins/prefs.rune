@@ -1,0 +1,31 @@
+// Fixture plugin: plugin-declared settings. `prefs/report` shows all
+// four values; `prefs/tweak` mutates them through set_setting (and
+// shows a type mismatch being rejected). The replay also drives the
+// builtin `:set` against these settings.
+pub fn init(rx) {
+    rx.declare_setting("prefs/flag", false);
+    rx.declare_setting("prefs/level", 3);
+    rx.declare_setting("prefs/ratio", 0.5);
+    rx.declare_setting("prefs/name", "alpha");
+    rx.register_command("prefs/report", [], "Report prefs settings", report);
+    rx.register_command("prefs/tweak", [], "Mutate prefs settings", tweak);
+    #{}
+}
+
+pub fn report(state, rx, args) {
+    let flag = rx.setting("prefs/flag");
+    let level = rx.setting("prefs/level");
+    let ratio = rx.setting("prefs/ratio");
+    let name = rx.setting("prefs/name");
+    rx.message(`flag=${flag} level=${level} ratio=${ratio} name=${name}`);
+}
+
+pub fn tweak(state, rx, args) {
+    let ok = rx.set_setting("prefs/flag", true)
+        && rx.set_setting("prefs/level", 7)
+        && rx.set_setting("prefs/ratio", 1.5)
+        && rx.set_setting("prefs/name", "beta");
+    // Type mismatch must be rejected.
+    let bad = rx.set_setting("prefs/level", "nope");
+    rx.message(`tweak ok=${ok} bad=${bad}`);
+}

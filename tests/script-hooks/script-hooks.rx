@@ -1,0 +1,14 @@
+-- Exercises plugin hooks (cursor_moved, mouse_input, switch_mode,
+-- update) and export/call_plugin across two fixture plugins. The
+-- cursor stays off-view so clicks don't paint; the message line is
+-- the digest-visible state.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+map 1 :hooks/report
+map 2 :hooks/call

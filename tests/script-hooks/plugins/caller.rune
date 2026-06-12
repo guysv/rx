@@ -1,0 +1,13 @@
+// Fixture plugin: cross-plugin calls. Fetches probe's summary through
+// the host-mediated export and posts it with its own prefix.
+pub fn init(rx) {
+    rx.register_command("hooks/call", [], "Call probe::summary cross-plugin", call);
+    #{}
+}
+
+pub fn call(state, rx, args) {
+    match rx.call_plugin("probe", "summary", []) {
+        Ok(s) => rx.message(`via-call ${s}`),
+        Err(e) => rx.message(`via-call error: ${e}`),
+    }
+}

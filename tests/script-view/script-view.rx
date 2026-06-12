@@ -1,0 +1,21 @@
+-- Exercises the view/selection scripting APIs: selection round-trip,
+-- clear_view_rect (a hole appears in the white fill), view_pixels
+-- snapshot readback, views()/offset and coordinate conversions, and
+-- damage_view/touch_view. The message line is the digest-visible
+-- state alongside the pixel changes.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff
+
+map 1 :vw/sel
+map 2 :vw/cut
+map 3 :vw/px
+map 4 :vw/info
+map 5 :vw/coords
+map 6 :vw/damage

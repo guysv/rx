@@ -1,0 +1,13 @@
+-- Exercises the GPU scripting API: read_file/create_shader, render and
+-- compute pipelines, bind groups, sprite vertices, and the pass chain
+-- compute -> texture render pass -> view pass (recorded, so undo
+-- round-trips it), plus the per-frame staging preview toggle.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

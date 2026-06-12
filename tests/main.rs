@@ -137,6 +137,26 @@ fn script_bind() {
 }
 
 #[test]
+fn script_settings() {
+    test("script-settings");
+}
+
+#[test]
+fn script_hooks() {
+    test("script-hooks");
+}
+
+#[test]
+fn script_view() {
+    test("script-view");
+}
+
+#[test]
+fn script_gpu() {
+    test("script-gpu");
+}
+
+#[test]
 fn selection_outline() {
     plugin_test("selection-outline");
 }
