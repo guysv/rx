@@ -812,14 +812,58 @@ pub struct ScriptCommand {
     handler: Function,
 }
 
+/// A function a plugin exports for other plugins to call (the
+/// meta-plugin mechanism). Cross-unit Rune function values don't work
+/// — a consumer VM cannot execute a foreign unit's offsets — so calls
+/// are host-mediated: the handler runs on its own unit with its own
+/// plugin's state, like a command handler.
+pub struct ScriptExport {
+    plugin: String,
+    name: String,
+    handler: Function,
+    /// The owning plugin's state; filled in by the host once `init`
+    /// returns (exports are registered during `init`, before the
+    /// state value exists).
+    state: Option<Value>,
+}
+
 /// All commands registered by loaded plugins. Owned by [`PluginHost`];
 /// reachable from hooks through [`Ctx`] for registration.
 #[derive(Default)]
 pub struct ScriptCommands {
     entries: Vec<ScriptCommand>,
+    exports: Vec<ScriptExport>,
 }
 
 impl ScriptCommands {
+    fn add_export(&mut self, export: ScriptExport) -> Result<(), String> {
+        if self
+            .exports
+            .iter()
+            .any(|e| e.plugin == export.plugin && e.name == export.name)
+        {
+            return Err(format!(
+                "`{}::{}` is already exported",
+                export.plugin, export.name
+            ));
+        }
+        self.exports.push(export);
+        Ok(())
+    }
+
+    fn get_export(&self, plugin: &str, name: &str) -> Option<&ScriptExport> {
+        self.exports
+            .iter()
+            .find(|e| e.plugin == plugin && e.name == name)
+    }
+
+    /// Attach the owning plugin's state to its exports (post-init).
+    fn fill_export_states(&mut self, plugin: &str, state: &Value) {
+        for e in self.exports.iter_mut().filter(|e| e.plugin == plugin) {
+            e.state = Some(state.clone());
+        }
+    }
+
     fn register(&mut self, cmd: ScriptCommand) -> Result<(), String> {
         if let Some(existing) = self.entries.iter().find(|c| c.name == cmd.name) {
             return Err(format!(
@@ -841,6 +885,7 @@ impl ScriptCommands {
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.exports.clear();
     }
 
     /// `(name, help)` pairs for the help view.
@@ -1646,6 +1691,75 @@ impl Ctx {
         })
     }
 
+    /// Export a function for other plugins to call via
+    /// `rx.call_plugin`. The handler is called as
+    /// `handler(state, rx, args)` with the *exporting* plugin's state.
+    /// Returns whether the export succeeded.
+    #[rune::function]
+    fn export(&mut self, name: &str, handler: Function) -> bool {
+        use crate::session::MessageType;
+
+        if self.cmds.is_null() {
+            self.session_mut().message(
+                format!("Error: `{}` cannot be exported in this context", name),
+                MessageType::Error,
+            );
+            return false;
+        }
+        let export = ScriptExport {
+            plugin: self.plugin.clone(),
+            name: name.to_string(),
+            handler,
+            state: None,
+        };
+        let result = unsafe { &mut *self.cmds }.add_export(export);
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.session_mut()
+                    .message(format!("Error: {}", e), MessageType::Error);
+                false
+            }
+        }
+    }
+
+    /// Call a function another plugin exported:
+    /// `rx.call_plugin(plugin, name, args)`. The callee runs with its
+    /// own plugin's state and this same context. Errors if the export
+    /// doesn't exist or the callee fails.
+    #[rune::function]
+    fn call_plugin(
+        &mut self,
+        plugin: &str,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        use rune::alloc::clone::TryClone;
+
+        if self.cmds.is_null() {
+            return Err("plugins cannot be called in this context".to_string());
+        }
+        let (handler, state) = {
+            let cmds = unsafe { &*self.cmds };
+            let Some(export) = cmds.get_export(plugin, name) else {
+                return Err(format!("no such export: {}::{}", plugin, name));
+            };
+            let Some(state) = export.state.clone() else {
+                return Err(format!("{}::{} is not initialized", plugin, name));
+            };
+            let handler = export
+                .handler
+                .try_clone()
+                .map_err(|e| format!("{}::{}: {}", plugin, name, e))?;
+            (handler, state)
+        };
+        let args = rune::to_value(args).map_err(|e| e.to_string())?;
+        handler
+            .call::<Value>((state, &mut *self, args))
+            .into_result()
+            .map_err(|e| first_line_str(&e.to_string()))
+    }
+
     /// Bind keys in a script mode: `rx.bind(mode, mapping)`. The mode is
     /// a script-mode name prefix; the mapping uses `:map` syntax, e.g.
     /// `"<tab> :v/prev"` or `"'r' :rotate 90 {:rotate 0}"`. The binding
@@ -1804,6 +1918,8 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::register_command)?;
     m.function_meta(Ctx::register_command_repeating)?;
     m.function_meta(Ctx::bind)?;
+    m.function_meta(Ctx::export)?;
+    m.function_meta(Ctx::call_plugin)?;
     m.function_meta(Ctx::run_builtin)?;
     m.function_meta(Ctx::draw_text)?;
     m.function_meta(Ctx::draw_line)?;
@@ -2158,6 +2274,7 @@ impl PluginHost {
                 }
             };
             log::info!("plugin `{}` loaded from {}", name, path.display());
+            self.commands.fill_export_states(&name, &state);
             self.plugins.push(Plugin {
                 name,
                 script,
@@ -3998,6 +4115,67 @@ mod test {
         }
         assert!(matches!(session.effects[2], Effect::ViewDamaged(_, None)));
         assert!(session.views.active().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn meta_plugin_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        // `algo` exports a function; `caller` (loads after, lexicographic)
+        // invokes it through the host-mediated registry.
+        write_plugin(
+            dir.path(),
+            "algo",
+            r#"
+            pub fn init(rx) {
+                rx.export("scale", scale);
+                #{ calls: 0 }
+            }
+            pub fn scale(state, rx, args) {
+                state.calls += 1;
+                args[0] * 2
+            }
+            pub fn calls(state) { state.calls }
+            "#,
+        );
+        write_plugin(
+            dir.path(),
+            "caller",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("use-algo", [], "Call into algo", run);
+                #{}
+            }
+            pub fn run(state, rx, args) {
+                let doubled = rx.call_plugin("algo", "scale", [21]).unwrap();
+                let missing = rx.call_plugin("algo", "no/such", []);
+                rx.message(`${doubled} ${missing.is_err()}`);
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 2);
+
+        host.dispatch_command(&mut session, "use-algo", "");
+        assert_eq!(session.message.to_string(), "42 true");
+
+        // The exporter's own state was mutated by the call.
+        let algo = host.plugins().find(|p| p.name == "algo").unwrap();
+        let calls = algo.script.call("calls", (algo.state.clone(),)).unwrap();
+        let calls: i64 = rune::from_value(calls).unwrap();
+        assert_eq!(calls, 1, "the export must run against the exporter's state");
+
+        // Reload clears exports along with commands.
+        std::fs::write(dir.path().join("algo.rune"), "pub fn init(rx) { #{} }").unwrap();
+        host.reload(&mut session);
+        host.dispatch_command(&mut session, "use-algo", "");
+        assert!(
+            session.message.to_string().contains("disabled"),
+            "calling a gone export must fail loudly: {}",
+            session.message
+        );
     }
 
     #[test]
