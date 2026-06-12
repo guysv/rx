@@ -1918,19 +1918,22 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             }
         }
 
-        // Record snapshot whenever the active view is dirty (match GL path).
-        let active_view = session.views.active();
-        let should_record = active_view
+        // Record a snapshot of every dirty view — not just the active
+        // one: scripts edit other views through view passes +
+        // touch_view (the v3 cross-view recording fix, `e540903`).
+        let should_record: Vec<_> = session
+            .views
+            .iter()
             .filter(|v| v.is_dirty())
-            .map(|v| (v.id, v.is_resized()));
+            .map(|v| (v.id, v.is_resized()))
+            .collect();
 
         self.queue.submit(std::iter::once(encoder.finish()));
         if let Some(output) = output {
             output.present();
         }
 
-        // If active view is dirty, record a snapshot of it (like GL layer.pixels()).
-        if let Some((view_id, was_resized)) = should_record {
+        for (view_id, was_resized) in should_record {
             let view_data = self
                 .view_data
                 .get(&view_id)

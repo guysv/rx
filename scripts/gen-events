@@ -33,6 +33,10 @@ def emit(event, step=5):
 
 def key(name):
     emit(f"keyboard/input {name} pressed")
+    # Character bindings fire on char/received (real recordings carry
+    # both lines for letter keys).
+    if len(name) == 1:
+        emit(f"char/received '{name}'")
     emit(f"keyboard/input {name} released")
 
 
