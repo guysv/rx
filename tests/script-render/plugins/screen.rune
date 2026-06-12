@@ -1,0 +1,52 @@
+// Fixture plugin: the P23 `render` stage. Every frame, two textured
+// quads are drawn onto the live screen pass:
+//
+// - a red/yellow checker pinned to *session* coordinate (300, 200) —
+//   its transform composes `rx.offset()`, so panning the workspace
+//   moves it together with the views;
+// - the same checker pinned to *screen* coordinate (60, 600) — no
+//   offset, so it must not move when the session pans.
+pub fn init(rx) {
+    let wgsl = rx.read_file("screen.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+
+    let tex = rx.create_texture(8, 8).unwrap();
+    let data = Bytes::new();
+    for i in 0..64 {
+        if (i % 8 + i / 8) % 2 == 0 {
+            data.extend(b"\xff\x00\x00\xff");
+        } else {
+            data.extend(b"\xff\xff\x00\xff");
+        }
+    }
+    tex.upload(data);
+
+    #{ pipeline, tex }
+}
+
+fn quad(state, rx, pass, transform, w, h) {
+    let tbg = rx.create_transform_bind_group(w, h, transform).unwrap();
+    let sbg = rx.create_texture_bind_group(state.tex).unwrap();
+    let v = rx.create_sprite_vertices(
+        state.tex,
+        rx::rect(0.0, 0.0, 64.0, 64.0),
+        rx::rgb(255, 255, 255),
+        1.0,
+    ).unwrap();
+    pass.set_pipeline(state.pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+}
+
+pub fn render(state, rx, pass) {
+    let (w, h) = rx.screen_size();
+    let (ox, oy) = rx.offset();
+
+    // Session-space placement: composes the workspace offset.
+    quad(state, rx, pass, rx::mat4_translation(ox + 300.0, oy + 200.0), w, h);
+    // Screen-space placement: fixed.
+    quad(state, rx, pass, rx::mat4_translation(60.0, 600.0), w, h);
+}
