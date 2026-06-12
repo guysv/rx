@@ -135,6 +135,11 @@ fn selection_outline() {
 }
 
 #[test]
+fn cleanedge() {
+    test("cleanedge");
+}
+
+#[test]
 fn source() {
     test("source");
 }

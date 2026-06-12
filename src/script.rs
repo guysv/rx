@@ -138,10 +138,12 @@ impl Gfx {
                 },
             ],
         });
+        // Clamp-to-edge: what pixel-art filters sampling outside the
+        // source (cleanedge & co) want.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest,
@@ -1213,6 +1215,32 @@ impl Ctx {
         }
     }
 
+    /// Declare a setting this plugin owns, with its default value
+    /// (bool, int, float or string). Declared settings are `:set`-able
+    /// like builtins; re-declaring is a no-op.
+    #[rune::function]
+    fn declare_setting(&mut self, name: &str, value: Value) -> bool {
+        use crate::cmd::Value as V;
+
+        let v = if let Ok(b) = rune::from_value::<bool>(value.clone()) {
+            V::Bool(b)
+        } else if let Ok(n) = rune::from_value::<i64>(value.clone()) {
+            V::U32(n as u32)
+        } else if let Ok(f) = rune::from_value::<f64>(value.clone()) {
+            V::F64(f)
+        } else if let Ok(s) = rune::from_value::<String>(value) {
+            V::Str(s)
+        } else {
+            self.session_mut().message(
+                format!("Error: unsupported value for setting `{}`", name),
+                crate::session::MessageType::Error,
+            );
+            return false;
+        };
+        self.session_mut().settings.declare(name, v);
+        true
+    }
+
     /// The current selection bounds as `(x1, y1, x2, y2)`, if any.
     #[rune::function]
     fn selection(&self) -> Option<(i64, i64, i64, i64)> {
@@ -1912,6 +1940,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::views)?;
     m.function_meta(Ctx::setting)?;
     m.function_meta(Ctx::set_setting)?;
+    m.function_meta(Ctx::declare_setting)?;
     m.function_meta(Ctx::selection)?;
     m.function_meta(Ctx::set_selection)?;
     m.function_meta(Ctx::clear_selection)?;
