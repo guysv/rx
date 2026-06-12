@@ -7,7 +7,18 @@ use std::str::FromStr;
 
 /// RGBA color with 8-bit channels.
 #[repr(C)]
-#[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Debug, Default)]
+#[derive(
+    Copy,
+    Clone,
+    PartialOrd,
+    Ord,
+    PartialEq,
+    Eq,
+    Debug,
+    Default,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+)]
 pub struct Rgba8 {
     pub r: u8,
     pub g: u8,

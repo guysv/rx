@@ -39,3 +39,9 @@ tempfile = "3"
 toml = "0.5"
 serde = "1.0"
 serde_derive = "1.0"
+
+# Optimize dependencies (wgpu, seahash, ...) even in dev/test builds; the
+# e2e replay tests hash a full-screen GPU readback per frame and are much
+# slower with unoptimized deps. rx itself stays at opt-level 0 for fast builds.
+[profile.dev.package."*"]
+opt-level = 2
