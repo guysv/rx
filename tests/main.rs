@@ -125,6 +125,11 @@ fn script_mode() {
 }
 
 #[test]
+fn script_bind() {
+    test("script-bind");
+}
+
+#[test]
 fn source() {
     test("source");
 }

@@ -3,7 +3,9 @@ use crate::brush::BrushMode;
 use crate::history::History;
 use crate::parser::*;
 use crate::platform;
-use crate::session::{Direction, Input, Mode, PanState, Tool, VisualState};
+use crate::session::{
+    BindingTier, Direction, Input, Mode, ModeString, PanState, Tool, VisualState,
+};
 
 use memoir::traits::Parse;
 use memoir::*;
@@ -307,13 +309,11 @@ pub struct KeyMapping {
     pub input: Input,
     pub press: Command,
     pub release: Option<Command>,
-    pub modes: Vec<Mode>,
+    pub tier: BindingTier,
 }
 
 impl KeyMapping {
-    pub fn parser(modes: &[Mode]) -> Parser<KeyMapping> {
-        let modes = modes.to_vec();
-
+    pub fn parser(tier: BindingTier) -> Parser<KeyMapping> {
         // Prevent stack overflow.
         let press = Parser::new(
             move |input| Commands::default().parser().parse(input),
@@ -356,7 +356,7 @@ impl KeyMapping {
                 input,
                 press,
                 release,
-                modes: modes.clone(),
+                tier: tier.clone(),
             })
             .label("<key> <cmd>") // TODO: We should provide the full command somehow.
     }
@@ -916,28 +916,49 @@ impl Default for Commands {
                     .map(|(_, (x, y))| Command::Pan(x, y))
             })
             .command("map", "Map keys to a command in all modes", |p| {
-                p.then(KeyMapping::parser(&[
-                    Mode::Normal,
-                    Mode::Visual(VisualState::selecting()),
-                    Mode::Visual(VisualState::Pasting),
-                ]))
-                .map(|(_, km)| Command::Map(Box::new(km)))
+                p.then(KeyMapping::parser(BindingTier::General))
+                    .map(|(_, km)| Command::Map(Box::new(km)))
             })
             .command("map/visual", "Map keys to a command in visual mode", |p| {
-                p.then(KeyMapping::parser(&[
+                p.then(KeyMapping::parser(BindingTier::ModeSpecific(vec![
                     Mode::Visual(VisualState::selecting()),
                     Mode::Visual(VisualState::Pasting),
-                ]))
+                ])))
                 .map(|(_, km)| Command::Map(Box::new(km)))
             })
             .command("map/normal", "Map keys to a command in normal mode", |p| {
-                p.then(KeyMapping::parser(&[Mode::Normal]))
-                    .map(|(_, km)| Command::Map(Box::new(km)))
+                p.then(KeyMapping::parser(BindingTier::ModeSpecific(vec![
+                    Mode::Normal,
+                ])))
+                .map(|(_, km)| Command::Map(Box::new(km)))
             })
             .command("map/help", "Map keys to a command in help mode", |p| {
-                p.then(KeyMapping::parser(&[Mode::Help]))
-                    .map(|(_, km)| Command::Map(Box::new(km)))
+                p.then(KeyMapping::parser(BindingTier::ModeSpecific(vec![
+                    Mode::Help,
+                ])))
+                .map(|(_, km)| Command::Map(Box::new(km)))
             })
+            .command(
+                "map/script",
+                "Map keys to a command in a script mode",
+                |p| {
+                    p.then(Parser::new(
+                        |input: &str| {
+                            let input = input.trim_start();
+                            let (name_str, rest) =
+                                quoted().parse(input).map_err(|(e, _)| (e, input))?;
+                            let name = ModeString::try_from_str(&name_str)
+                                .map_err(|e| (format!("{}", e).into(), rest))?;
+                            let rest = rest.trim_start();
+                            let (km, rest) =
+                                KeyMapping::parser(BindingTier::Script(name)).parse(rest)?;
+                            Ok((km, rest))
+                        },
+                        "<script-mode> <key> <cmd>",
+                    ))
+                    .map(|(_, km)| Command::Map(Box::new(km)))
+                },
+            )
             .command("map/clear!", "Clear all key mappings", |p| {
                 p.value(Command::MapClear)
             })
@@ -1483,7 +1504,7 @@ mod test {
     fn test_keymapping_parser() {
         let p = string("map")
             .skip(whitespace())
-            .then(KeyMapping::parser(&[]));
+            .then(KeyMapping::parser(BindingTier::General));
 
         let (_, rest) = p.parse("map <tab> :q! {:q}").unwrap();
         assert_eq!(rest, "");
@@ -1495,6 +1516,25 @@ mod test {
 
         let (_, rest) = p.parse("map <ctrl> :tool sampler {:tool/prev}").unwrap();
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_map_script_parser() {
+        let p = Commands::default().line_parser();
+        let (cmd, rest) = p
+            .parse(r#":map/script "visual (rotation)" <tab> :v/prev"#)
+            .unwrap();
+        assert_eq!(rest, "");
+        match &cmd {
+            Command::Map(km) => {
+                assert_eq!(km.input, Input::Key(platform::Key::Tab));
+                assert!(matches!(
+                    &km.tier,
+                    BindingTier::Script(name) if name.as_str() == "visual (rotation)"
+                ));
+            }
+            _ => panic!("expected Command::Map, got {:?}", cmd),
+        }
     }
 
     #[test]

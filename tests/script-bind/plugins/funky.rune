@@ -1,0 +1,17 @@
+// Fixture plugin: script-tier binding override. `.` is generally bound
+// to `:zoom +` (default config); in funky mode the script binding wins
+// and posts a message instead of zooming.
+pub fn init(rx) {
+    rx.register_command("funky", [], "Enter funky mode", enter);
+    rx.register_command("funky/hello", [], "Say hello", hello);
+    rx.bind("funky", ". :funky/hello");
+    #{}
+}
+
+pub fn enter(state, rx, args) {
+    rx.switch_mode("funky");
+}
+
+pub fn hello(state, rx, args) {
+    rx.message("funky hello");
+}

@@ -528,6 +528,47 @@ impl Ctx {
         }
     }
 
+    /// Bind keys in a script mode: `rx.bind(mode, mapping)`. The mode is
+    /// a script-mode name prefix; the mapping uses `:map` syntax, e.g.
+    /// `"<tab> :v/prev"` or `"'r' :rotate 90 {:rotate 0}"`. The binding
+    /// is script-tier: it wins over general bindings while the mode is
+    /// active and may fire even while the mouse is held. Returns whether
+    /// the mapping parsed.
+    #[rune::function]
+    fn bind(&mut self, mode: &str, mapping: &str) -> bool {
+        use crate::cmd::{Command, KeyMapping};
+        use crate::session::{BindingTier, MessageType, ModeString};
+
+        let name = match ModeString::try_from_str(mode) {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                self.session_mut().message(
+                    format!("Error: invalid mode name `{}`", mode),
+                    MessageType::Error,
+                );
+                return false;
+            }
+        };
+        match KeyMapping::parser(BindingTier::Script(name)).parse(mapping.trim()) {
+            Ok((km, rest)) if rest.trim().is_empty() => {
+                self.session_mut().command(Command::Map(Box::new(km)));
+                true
+            }
+            Ok((_, rest)) => {
+                self.session_mut().message(
+                    format!("Error: trailing input in mapping: `{}`", rest),
+                    MessageType::Error,
+                );
+                false
+            }
+            Err((e, _)) => {
+                self.session_mut()
+                    .message(format!("Error: {}", e), MessageType::Error);
+                false
+            }
+        }
+    }
+
     /// Run a builtin command, e.g. `rx.run_builtin("v/center")`. Script
     /// commands are not resolvable through this; it exists so handlers
     /// can delegate to (or compose) default behavior. Returns whether the
@@ -639,6 +680,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::clear_selection)?;
     m.function_meta(Ctx::register_command)?;
     m.function_meta(Ctx::register_command_repeating)?;
+    m.function_meta(Ctx::bind)?;
     m.function_meta(Ctx::run_builtin)?;
     m.function_meta(Ctx::draw_text)?;
     m.function_meta(Ctx::draw_line)?;
@@ -1858,6 +1900,106 @@ mod test {
             &mut host,
         );
         assert_eq!(session.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn script_bindings_via_bind() {
+        use crate::event::Event;
+        use crate::execution::Execution;
+        use crate::platform;
+        use crate::session::{Mode, MessageType};
+        use crate::view::FileStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("funky/hello", [], "Say hello", hello);
+                let ok = rx.bind("funky", "<tab> :funky/hello");
+                let bad = rx.bind("funky", "<nokey> :funky/hello");
+                if !ok || bad {
+                    rx.message("bind results wrong");
+                }
+                #{}
+            }
+            pub fn hello(state, rx, args) { rx.message("funky hello"); }
+            "#,
+        );
+        let mut session = session.with_blank(FileStatus::NoFile, 32, 32);
+        let mut exec = Execution::normal().unwrap();
+
+        let tab = |state| {
+            vec![Event::KeyboardInput(platform::KeyboardInput {
+                key: Some(platform::Key::Tab),
+                modifiers: platform::ModifiersState::default(),
+                state,
+            })]
+        };
+
+        // In the script mode, <tab> runs the script command.
+        session.switch_mode(Mode::Script("funky".try_into().unwrap()));
+        session.update(
+            &mut tab(platform::InputState::Pressed),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.message.to_string(), "funky hello");
+        session.update(
+            &mut tab(platform::InputState::Released),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+
+        // Script-tier bindings fire even while the mouse is held.
+        session.message("sentinel", MessageType::Info);
+        let mouse = |state| vec![Event::MouseInput(platform::MouseButton::Left, state)];
+        session.update(
+            &mut mouse(platform::InputState::Pressed),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        session.update(
+            &mut tab(platform::InputState::Pressed),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.message.to_string(), "funky hello");
+        session.update(
+            &mut mouse(platform::InputState::Released),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        session.update(
+            &mut tab(platform::InputState::Released),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+
+        // Outside the mode, the script binding is inert.
+        session.switch_mode(Mode::Normal);
+        session.message("sentinel", MessageType::Info);
+        session.update(
+            &mut tab(platform::InputState::Pressed),
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.message.to_string(), "sentinel");
     }
 
     #[test]

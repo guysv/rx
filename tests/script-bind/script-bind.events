@@ -1,0 +1,18 @@
+00000 0000010 cursor/moved 639 359
+00010 0000100 keyboard/input . pressed
+00015 0000150 keyboard/input . released
+00050 0000500 char/received ':'
+00060 0000600 char/received 'f'
+00070 0000700 char/received 'u'
+00080 0000800 char/received 'n'
+00090 0000900 char/received 'k'
+00100 0001000 char/received 'y'
+00110 0001100 keyboard/input <return> pressed
+00115 0001150 keyboard/input <return> released
+00150 0001500 keyboard/input . pressed
+00155 0001550 keyboard/input . released
+00190 0001900 keyboard/input <esc> pressed
+00195 0001950 keyboard/input <esc> released
+00230 0002300 keyboard/input . pressed
+00235 0002350 keyboard/input . released
+00270 0002700 cursor/moved 640 360
