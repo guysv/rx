@@ -1,0 +1,27 @@
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = off
+
+map         v           :mode visual
+map         u           :undo
+map         a           :layer/add
+map         n           :layer/next
+map         p           :layer/prev
+map         i           :layer/hide
+map         s           :layer/show
+map         o           :layer/solo
+map         t           :layer/opacity 0.5 1
+map         w           :layer/opacity 1 1
+map         d           :set layers/dim = 0.5
+map         c           :set layers/dim = 1.0
+map         q           :layer/up
+map         m           :layer/merge
+map         f           :layer/flatten
+map/visual  \           :selection/expand
+map/visual  1           :selection/fill #ff0000
+map/visual  2           :selection/fill #0055ff
+map/visual  e           :selection/erase

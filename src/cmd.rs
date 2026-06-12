@@ -76,6 +76,14 @@ pub enum Command {
     LayerNext,
     LayerPrev,
     LayerSet(i32),
+    LayerHide(Option<i32>),
+    LayerShow(Option<i32>),
+    LayerSolo,
+    LayerOpacity(f32, Option<i32>),
+    LayerUp,
+    LayerDown,
+    LayerMerge,
+    LayerFlatten,
 
     // Palette
     PaletteAdd(Rgba8),
@@ -192,6 +200,14 @@ impl fmt::Display for Command {
             Self::LayerNext => write!(f, "Activate the layer above the active one"),
             Self::LayerPrev => write!(f, "Activate the layer below the active one"),
             Self::LayerSet(i) => write!(f, "Activate layer {}", i),
+            Self::LayerHide(_) => write!(f, "Hide a layer"),
+            Self::LayerShow(_) => write!(f, "Show a layer"),
+            Self::LayerSolo => write!(f, "Toggle showing only the active layer"),
+            Self::LayerOpacity(o, _) => write!(f, "Set a layer's opacity to {}", o),
+            Self::LayerUp => write!(f, "Move the active layer up"),
+            Self::LayerDown => write!(f, "Move the active layer down"),
+            Self::LayerMerge => write!(f, "Merge the active layer into the one below"),
+            Self::LayerFlatten => write!(f, "Flatten all visible layers into one"),
             Self::FramePrev => write!(f, "Navigate to previous frame"),
             Self::FrameNext => write!(f, "Navigate to next frame"),
             Self::Noop => write!(f, "No-op"),
@@ -287,6 +303,17 @@ impl From<Command> for String {
             Command::LayerNext => format!("layer/next"),
             Command::LayerPrev => format!("layer/prev"),
             Command::LayerSet(i) => format!("layer/set {}", i),
+            Command::LayerHide(Some(i)) => format!("layer/hide {}", i),
+            Command::LayerHide(None) => format!("layer/hide"),
+            Command::LayerShow(Some(i)) => format!("layer/show {}", i),
+            Command::LayerShow(None) => format!("layer/show"),
+            Command::LayerSolo => format!("layer/solo"),
+            Command::LayerOpacity(o, Some(i)) => format!("layer/opacity {} {}", o, i),
+            Command::LayerOpacity(o, None) => format!("layer/opacity {}", o),
+            Command::LayerUp => format!("layer/up"),
+            Command::LayerDown => format!("layer/down"),
+            Command::LayerMerge => format!("layer/merge"),
+            Command::LayerFlatten => format!("layer/flatten"),
             Command::Export(None, path) => format!("export {}", path),
             Command::Export(Some(s), path) => format!("export @{}x {}", s, path),
             Command::Noop => format!(""),
@@ -1044,6 +1071,46 @@ impl Default for Commands {
                 p.then(integer::<i32>().label("<index>"))
                     .map(|(_, index)| Command::LayerSet(index))
             })
+            .command("layer/hide", "Hide a layer (default: active)", |p| {
+                p.then(optional(integer::<i32>().label("<index>")))
+                    .map(|(_, index)| Command::LayerHide(index))
+            })
+            .command("layer/show", "Show a layer (default: active)", |p| {
+                p.then(optional(integer::<i32>().label("<index>")))
+                    .map(|(_, index)| Command::LayerShow(index))
+            })
+            .command(
+                "layer/solo",
+                "Toggle showing only the active layer",
+                |p| p.value(Command::LayerSolo),
+            )
+            .command(
+                "layer/opacity",
+                "Set a layer's opacity (default: active)",
+                |p| {
+                    p.then(rational::<f32>().label("<opacity>"))
+                        .then(optional(
+                            whitespace().then(integer::<i32>().label("<index>")).map(|(_, i)| i),
+                        ))
+                        .map(|((_, o), index)| Command::LayerOpacity(o, index))
+                },
+            )
+            .command("layer/up", "Move the active layer up", |p| {
+                p.value(Command::LayerUp)
+            })
+            .command("layer/down", "Move the active layer down", |p| {
+                p.value(Command::LayerDown)
+            })
+            .command(
+                "layer/merge",
+                "Merge the active layer into the one below",
+                |p| p.value(Command::LayerMerge),
+            )
+            .command(
+                "layer/flatten",
+                "Flatten all visible layers into one",
+                |p| p.value(Command::LayerFlatten),
+            )
             .command("f/prev", "Navigate to previous frame", |p| {
                 p.value(Command::FramePrev)
             })

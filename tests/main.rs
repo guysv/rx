@@ -107,6 +107,11 @@ fn layers_active() {
 }
 
 #[test]
+fn layers_attrs() {
+    test("layers-attrs");
+}
+
+#[test]
 fn ui() {
     test("ui");
 }
