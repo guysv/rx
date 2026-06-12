@@ -88,18 +88,34 @@ impl Gfx {
     const MAX_COMPUTE_INPUTS: usize = 4;
 
     fn new(device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Self {
+        // Group 0: the transform at binding 0, user params at binding 1
+        // (always present in the layout; WGSL that doesn't declare
+        // binding 1 is unaffected, and `create_transform_bind_group`
+        // supplies a zeroed buffer).
         let transform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("script_transform_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX.union(wgpu::ShaderStages::FRAGMENT),
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("script_texture_bgl"),
@@ -189,6 +205,10 @@ const SCRIPT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uno
 
 /// Maximum dimension for script-created textures.
 const MAX_TEXTURE_DIM: i64 = 8192;
+
+/// Maximum user params per bind group (16 vec4s — plenty, and well
+/// under any uniform-buffer size limit).
+const MAX_PARAMS: usize = 64;
 
 /// A script-owned GPU texture (rgba8, render-attachable + bindable).
 ///
@@ -1637,15 +1657,14 @@ impl Ctx {
         Some(ScriptPipeline { pipeline })
     }
 
-    /// Create the group-0 uniforms bind group: an orthographic
-    /// projection for a `w`×`h` target (origin top-left), composed with
-    /// `transform`.
-    #[rune::function]
-    fn create_transform_bind_group(
+    /// Build the group-0 bind group: transform uniforms at binding 0,
+    /// `params` (already padded to vec4 granularity) at binding 1.
+    fn transform_bind_group(
         &mut self,
         w: i64,
         h: i64,
         transform: &Mat4,
+        params: &[f32],
     ) -> Option<ScriptBindGroup> {
         use crate::gfx::math::{Matrix4, Origin};
 
@@ -1678,15 +1697,81 @@ impl Ctx {
             .copy_from_slice(bytemuck::bytes_of(&uniforms));
         buffer.unmap();
 
+        let params_buffer = gfx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("script_params_buffer"),
+            size: (params.len() * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: true,
+        });
+        params_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(params));
+        params_buffer.unmap();
+
         let bind_group = gfx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("script_transform_bind_group"),
             layout: &gfx.transform_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
         });
         Some(ScriptBindGroup { bind_group })
+    }
+
+    /// Create the group-0 uniforms bind group: an orthographic
+    /// projection for a `w`×`h` target (origin top-left), composed with
+    /// `transform`. The user-params slot (binding 1) is a zeroed
+    /// vec4 — WGSL that doesn't declare it is unaffected.
+    #[rune::function]
+    fn create_transform_bind_group(
+        &mut self,
+        w: i64,
+        h: i64,
+        transform: &Mat4,
+    ) -> Option<ScriptBindGroup> {
+        self.transform_bind_group(w, h, transform, &[0.0; 4])
+    }
+
+    /// Like `create_transform_bind_group`, with user parameters at
+    /// **group 0, binding 1**, declared WGSL-side as
+    ///
+    /// ```wgsl
+    /// @group(0) @binding(1) var<uniform> params: array<vec4<f32>, N>;
+    /// ```
+    ///
+    /// where `N = ceil(len / 4)`; `params` is packed in order and
+    /// zero-padded to vec4 granularity (`params[i]` is component
+    /// `i % 4` of `params[i / 4]` in WGSL). An f32 holds 24 exact
+    /// integer bits, so pass a 32-bit bitmask as two 16-bit halves.
+    #[rune::function]
+    fn create_transform_params_bind_group(
+        &mut self,
+        w: i64,
+        h: i64,
+        transform: &Mat4,
+        params: Vec<f64>,
+    ) -> Option<ScriptBindGroup> {
+        if params.is_empty() || params.len() > MAX_PARAMS {
+            self.error(format!(
+                "invalid param count {} (1..={})",
+                params.len(),
+                MAX_PARAMS
+            ));
+            return None;
+        }
+        let mut packed: Vec<f32> = params.iter().map(|p| *p as f32).collect();
+        while packed.len() % 4 != 0 {
+            packed.push(0.0);
+        }
+        self.transform_bind_group(w, h, transform, &packed)
     }
 
     /// Create the group-1 bind group: a texture and a nearest sampler.
@@ -2122,6 +2207,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::create_shader)?;
     m.function_meta(Ctx::create_render_pipeline)?;
     m.function_meta(Ctx::create_transform_bind_group)?;
+    m.function_meta(Ctx::create_transform_params_bind_group)?;
     m.function_meta(Ctx::create_texture_bind_group)?;
     m.function_meta(Ctx::create_sprite_vertices)?;
     m.function_meta(rgb)?;
@@ -4214,6 +4300,114 @@ mod test {
         let pixels = target.pixels(&gfx.device);
         for px in pixels.chunks(4) {
             assert_eq!(px, &[0x00, 0x00, 0xff, 0xff]);
+        }
+    }
+
+    #[test]
+    fn params_bind_group_packs_and_pads() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // The fragment color is assembled from across the params array:
+        // x of the second vec4 (the 5th param), y of the first, and a
+        // padded slot (y of the second vec4), which must read zero.
+        std::fs::write(
+            dir.path().join("tint.wgsl"),
+            r#"
+            struct TransformUniforms { ortho: mat4x4<f32>, transform: mat4x4<f32>, }
+            @group(0) @binding(0) var<uniform> uniforms: TransformUniforms;
+            @group(0) @binding(1) var<uniform> params: array<vec4<f32>, 2>;
+
+            struct VertexInput {
+                @location(0) position: vec3<f32>,
+                @location(1) uv: vec2<f32>,
+                @location(2) color: vec4<f32>,
+                @location(3) opacity: f32,
+            }
+            struct VertexOutput { @builtin(position) pos: vec4<f32>, }
+
+            @vertex
+            fn vs_main(in: VertexInput) -> VertexOutput {
+                var out: VertexOutput;
+                out.pos = uniforms.ortho * uniforms.transform * vec4<f32>(in.position, 1.0);
+                return out;
+            }
+
+            @fragment
+            fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                return vec4<f32>(params[1].x, params[0].y, params[1].y, 1.0);
+            }
+            "#,
+        )
+        .unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                let wgsl = rx.read_file("tint.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 0).unwrap();
+                let target = rx.create_texture(4, 4).unwrap();
+                let source = rx.create_texture(4, 4).unwrap();
+                if rx.create_transform_params_bind_group(4, 4, rx::mat4_identity(), []).is_some() {
+                    panic!("[] accepted");
+                }
+                let tbg = rx.create_transform_params_bind_group(
+                    4, 4, rx::mat4_identity(),
+                    [0.0, 1.0, 0.0, 1.0, 1.0],
+                ).unwrap();
+                let verts = rx.create_sprite_vertices(
+                    source,
+                    rx::rect(0.0, 0.0, 4.0, 4.0),
+                    rx::rgb(255, 255, 255),
+                    1.0,
+                ).unwrap();
+                #{ pipeline, target, tbg, verts }
+            }
+            pub fn shade(state, rx, encoder) {
+                let pass = encoder.begin_render_pass("tint", state.target, "clear").unwrap();
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_vertex_buffer(0, state.verts).unwrap();
+                pass.draw(state.verts.count(), 1).unwrap();
+            }
+            pub fn target(state) { state.target }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().count(),
+            1,
+            "fixture plugin must load: {}",
+            session.message
+        );
+
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive: {}",
+            session.message
+        );
+
+        // (params[1].x, params[0].y, padding) = (1, 1, 0): yellow.
+        let plugin = host.plugins().next().unwrap();
+        let target = plugin
+            .script
+            .call("target", (plugin.state.clone(),))
+            .unwrap();
+        let target = target.borrow_ref::<ScriptTexture>().unwrap();
+        for px in target.pixels(&gfx.device).chunks(4) {
+            assert_eq!(px, &[0xff, 0xff, 0x00, 0xff]);
         }
     }
 

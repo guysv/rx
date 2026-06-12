@@ -167,6 +167,11 @@ fn script_multitex() {
 }
 
 #[test]
+fn script_params() {
+    test("script-params");
+}
+
+#[test]
 fn selection_outline() {
     plugin_test("selection-outline");
 }
