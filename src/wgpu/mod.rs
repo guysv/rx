@@ -17,6 +17,7 @@ use crate::gfx::{shape2d, sprite2d, Origin, Rgba, Rgba8, ZDepth};
 use crate::gfx::{Matrix4, Rect, Repeat, Vector2};
 
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "glfw")]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use std::collections::BTreeMap;
@@ -442,7 +443,9 @@ pub struct Renderer {
     // Core wgpu state
     device: wgpu::Device,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    /// `None` when running surface-less (dummy platform, e.g. headless tests);
+    /// everything still renders to `screen_texture`, only presentation is skipped.
+    surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
 
     // Draw context (same as GL version)
@@ -554,11 +557,13 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             ..Default::default()
         });
 
-        // Create surface from window handle
+        // Create surface from window handle. The dummy platform has no window
+        // handle; we run surface-less and skip presentation entirely.
         // SAFETY: The window handle is valid and the window will outlive the surface
         // because both are stored in the main loop and the renderer is dropped before
         // the window.
-        let surface = unsafe {
+        #[cfg(feature = "glfw")]
+        let surface = Some(unsafe {
             let raw_display_handle = win
                 .display_handle()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
@@ -574,12 +579,17 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             instance
                 .create_surface_unsafe(target)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        });
+        #[cfg(not(feature = "glfw"))]
+        let surface: Option<wgpu::Surface<'static>> = {
+            let _ = &win;
+            None
         };
 
         // Request adapter
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
+            compatible_surface: surface.as_ref(),
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No suitable adapter found"))?;
@@ -598,13 +608,22 @@ impl<'a> renderer::Renderer<'a> for Renderer {
 
         // Configure surface
         let physical = win_size.to_physical(scale_factor);
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+        let (surface_format, alpha_mode) = match &surface {
+            Some(surface) => {
+                let caps = surface.get_capabilities(&adapter);
+                let format = caps
+                    .formats
+                    .iter()
+                    .find(|f| f.is_srgb())
+                    .copied()
+                    .unwrap_or(caps.formats[0]);
+                (format, caps.alpha_modes[0])
+            }
+            None => (
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::CompositeAlphaMode::Auto,
+            ),
+        };
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -612,11 +631,13 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             width: physical.width as u32,
             height: physical.height as u32,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &surface_config);
+        if let Some(surface) = &surface {
+            surface.configure(&device, &surface_config);
+        }
 
         // Create sampler
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1176,11 +1197,16 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         self.update_view_animations(session);
         self.update_view_composites(session);
 
-        // Get surface texture
-        let output = self.surface.get_current_texture()?;
-        let surface_view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // Get surface texture (surface-less mode renders to `screen_texture` only)
+        let output = match &self.surface {
+            Some(surface) => Some(surface.get_current_texture()?),
+            None => None,
+        };
+        let surface_view = output.as_ref().map(|output| {
+            output
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
 
         let mut encoder = self
             .device
@@ -1695,8 +1721,9 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             }
         }
 
-        // Render screen to surface (final pass)
-        {
+        // Render screen to surface (final pass). Skipped surface-less: cursor and
+        // overlay only ever hit the swapchain, so digests are unaffected.
+        if let Some(surface_view) = &surface_view {
             let screen_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("screen_bind_group"),
                 layout: &self.screen_bind_group_layout,
@@ -1715,7 +1742,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
+                    view: surface_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1862,7 +1889,9 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             .map(|v| (v.id, v.is_resized()));
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        if let Some(output) = output {
+            output.present();
+        }
 
         // If active view is dirty, record a snapshot of it (like GL layer.pixels()).
         if let Some((view_id, was_resized)) = should_record {
@@ -1885,6 +1914,20 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         if !execution.is_normal() {
             let [w, h] = self.screen_texture.size;
             let texels = self.read_screen_pixels(w, h);
+            // Debug aid: dump each *distinct* frame as PNG when RX_DUMP_FRAMES
+            // is set to a directory (used to triage digest mismatches). Frames
+            // are deduped by hash, mirroring the digest recorder's stale check.
+            if let Ok(dir) = std::env::var("RX_DUMP_FRAMES") {
+                use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+                static FRAME_NO: AtomicUsize = AtomicUsize::new(0);
+                static LAST_HASH: AtomicU64 = AtomicU64::new(0);
+                let hash = seahash::hash(util::align_u8(&texels));
+                if LAST_HASH.swap(hash, Ordering::SeqCst) != hash {
+                    let n = FRAME_NO.fetch_add(1, Ordering::SeqCst);
+                    let path = std::path::Path::new(&dir).join(format!("{:04}.png", n));
+                    crate::image::save_as(&path, w, h, 1, &texels).ok();
+                }
+            }
             execution.record(&texels).ok();
         }
 
@@ -1904,7 +1947,9 @@ impl Renderer {
         if physical.width as u32 > 0 && physical.height as u32 > 0 {
             self.surface_config.width = physical.width as u32;
             self.surface_config.height = physical.height as u32;
-            self.surface.configure(&self.device, &self.surface_config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.surface_config);
+            }
         }
 
         self.win_size = size;
