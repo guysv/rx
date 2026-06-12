@@ -440,9 +440,10 @@ impl ViewData {
 pub struct Renderer {
     pub win_size: LogicalSize,
 
-    // Core wgpu state
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    // Core wgpu state. Arc'd so handles can be shared with the script
+    // host (wgpu 23 doesn't impl Clone on these; 24+ does).
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
     /// `None` when running surface-less (dummy platform, e.g. headless tests);
     /// everything still renders to `screen_texture`, only presentation is skipped.
     surface: Option<wgpu::Surface<'static>>,
@@ -595,7 +596,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No suitable adapter found"))?;
 
         // Request device and queue
-        let (device, queue) = pollster::block_on(adapter.request_device(
+        let (device, queue): (wgpu::Device, wgpu::Queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("rx_device"),
                 required_features: wgpu::Features::empty(),
@@ -605,6 +606,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             None,
         ))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let (device, queue) = (std::sync::Arc::new(device), std::sync::Arc::new(queue));
 
         // Configure surface
         let physical = win_size.to_physical(scale_factor);
@@ -1945,6 +1947,12 @@ impl<'a> renderer::Renderer<'a> for Renderer {
 }
 
 impl Renderer {
+    /// Shared handles to the device and queue for the script GPU
+    /// capability.
+    pub fn gpu_handles(&self) -> (std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>) {
+        (self.device.clone(), self.queue.clone())
+    }
+
     pub fn handle_resized(&mut self, size: platform::LogicalSize) {
         let physical = size.to_physical(self.scale_factor);
 

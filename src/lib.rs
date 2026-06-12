@@ -168,11 +168,15 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
 
     let wait_events = execution.is_normal() || execution.is_recording();
 
+    let mut renderer: wgpu::Renderer = Renderer::new(&mut win, win_size, scale_factor, assets)?;
+
+    // The renderer exists before plugins load, so `init` hooks can
+    // create GPU resources through the attached device/queue handles.
     let mut plugins = script::PluginHost::new(options.plugin_dir.clone())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let (device, queue) = renderer.gpu_handles();
+    plugins.attach_gfx(device, queue);
     plugins.load(&mut session);
-
-    let mut renderer: wgpu::Renderer = Renderer::new(&mut win, win_size, scale_factor, assets)?;
 
     if let Err(e) = session.edit(paths) {
         session.message(format!("Error loading path(s): {}", e), MessageType::Error);
