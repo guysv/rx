@@ -1296,6 +1296,9 @@ impl Ctx {
                 offset_x: v.offset.x as f64,
                 offset_y: v.offset.y as f64,
                 zoom: v.zoom as f64,
+                frames: v.animation.len() as i64,
+                frame_width: v.fw as i64,
+                frame_height: v.fh as i64,
             })
             .collect()
     }
@@ -2213,6 +2216,7 @@ fn rgb(r: i64, g: i64, b: i64) -> crate::gfx::color::Rgba8 {
 pub struct ViewInfo {
     #[rune(get)]
     pub id: i64,
+    /// Full sheet width: `frame_width * frames`.
     #[rune(get)]
     pub width: i64,
     #[rune(get)]
@@ -2223,6 +2227,15 @@ pub struct ViewInfo {
     pub offset_y: f64,
     #[rune(get)]
     pub zoom: f64,
+    /// Number of animation frames (1 for a still).
+    #[rune(get)]
+    pub frames: i64,
+    /// Width of a single animation frame.
+    #[rune(get)]
+    pub frame_width: i64,
+    /// Height of a single animation frame (same as `height`).
+    #[rune(get)]
+    pub frame_height: i64,
 }
 
 /// The native `rx` module installed into every plugin's context.
@@ -3349,6 +3362,37 @@ mod test {
         assert_eq!(count, 1);
         assert_eq!(id, 1);
         assert_eq!((w, h), (128, 96));
+    }
+
+    #[test]
+    fn view_info_frame_metadata() {
+        use crate::view::FileStatus;
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 128, 96);
+        // Two extra frames: the sheet is 3 frames wide, frame size
+        // stays 128x96.
+        session.command(crate::cmd::Command::FrameAdd);
+        session.command(crate::cmd::Command::FrameAdd);
+
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let v = rx.views()[0];
+                    (v.frames, v.frame_width, v.frame_height, v.width, v.height)
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (frames, fw, fh, w, h): (i64, i64, i64, i64, i64) = rune::from_value(v).unwrap();
+        assert_eq!((frames, fw, fh), (3, 128, 96));
+        // `width` is the full sheet: fw * frames.
+        assert_eq!((w, h), (3 * 128, 96));
     }
 
     #[test]
