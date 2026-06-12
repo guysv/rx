@@ -1,0 +1,461 @@
+// rotate-scale: selection rotation and scaling via custom visual
+// modes (Rune port of rotate-scale.rxx).
+//
+// :selection/rotate and :selection/scale enter the modes; dragging
+// with the mouse (or :rotate/set, :rotate/add, :scale/set, :scale/add)
+// builds a gesture transform around a pivot (right-click moves it);
+// the transformed selection previews in the view's staging texture
+// every frame; <return> (:rotate/apply) stamps it into the view as a
+// recorded, undoable edit; escape cancels. The `rotate-scale/algo`
+// setting names an interface plugin (cleanedge, mmpx, rotsprite) to
+// sample with; the default is nearest neighbor.
+//
+// State note: long-lived state avoids `Option` — Rune's `unwrap` takes
+// the inner value out of a shared Option, poisoning it for the next
+// hook call. Flags + Copy fields instead.
+
+const ROTATION_MODE = "visual (rotation)";
+const SCALE_MODE = "visual (scale)";
+const PIVOT_HALF = 6.0;
+
+pub fn init(rx) {
+    let wgsl = rx.read_file("nearest.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let nearest = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+
+    rx.declare_setting("rotate-scale/algo", "");
+
+    rx.register_command("selection/rotate", [], "Rotate the selection", selection_rotate);
+    rx.register_command_repeating("rotate/set", ["float"], "Set selection rotation (degrees)", rotate_set);
+    rx.register_command_repeating("rotate/add", ["float"], "Add to selection rotation (degrees)", rotate_add);
+    rx.register_command("selection/scale", [], "Scale the selection", selection_scale);
+    rx.register_command_repeating("scale/set", ["float", "float"], "Set selection scale", scale_set);
+    rx.register_command_repeating("scale/add", ["float", "float"], "Add to selection scale", scale_add);
+    rx.register_command("rotate/apply", [], "Stamp the transformed selection", apply);
+
+    // Default keys for the gesture modes. The command line is not
+    // reachable from script modes (only script-tier bindings fire), so
+    // the commands are bound here; users can re-bind via :map/script.
+    rx.bind(ROTATION_MODE, "<return> :rotate/apply");
+    rx.bind(SCALE_MODE, "<return> :rotate/apply");
+    rx.bind(ROTATION_MODE, "'e' :rotate/add 15");
+    rx.bind(ROTATION_MODE, "'q' :rotate/add -15");
+    rx.bind(ROTATION_MODE, "'s' :selection/scale");
+    rx.bind(SCALE_MODE, "'e' :scale/add 0.2 0.2");
+    rx.bind(SCALE_MODE, "'q' :scale/add -0.2 -0.2");
+    rx.bind(SCALE_MODE, "'r' :selection/rotate");
+
+    #{
+        nearest,
+        rotation_degrees: 0.0,
+        scale_x: 1.0,
+        scale_y: 1.0,
+        committed: rx::mat4_identity(),
+        gesture: rx::mat4_identity(),
+        has_pivot: false,
+        pivot_x: 0.0,
+        pivot_y: 0.0,
+        dragging: false,
+        drag_x: 0.0,
+        drag_y: 0.0,
+        clipboard: (),
+        in_progress: false,
+        pasted_once: false,
+        apply_queued: false,
+        active_view_id: 0,
+        has_base: false,
+        bx1: 0,
+        by1: 0,
+        bx2: 0,
+        by2: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gesture state
+// ---------------------------------------------------------------------------
+
+fn wrap_degrees(degrees) {
+    let wrapped = degrees - (degrees / 360.0).floor() * 360.0;
+    if wrapped > 180.0 {
+        wrapped - 360.0
+    } else {
+        wrapped
+    }
+}
+
+fn pivot_transform(state, inner) {
+    if !state.has_pivot {
+        return rx::mat4_identity();
+    }
+    let t1 = rx::mat4_translation(-state.pivot_x, -state.pivot_y);
+    let t2 = rx::mat4_translation(state.pivot_x, state.pivot_y);
+    rx::mat4_mul(t2, rx::mat4_mul(inner, t1))
+}
+
+fn total_transform(state) {
+    rx::mat4_mul(state.gesture, state.committed)
+}
+
+fn commit_gesture(state) {
+    state.committed = rx::mat4_mul(state.gesture, state.committed);
+    state.gesture = rx::mat4_identity();
+    state.rotation_degrees = 0.0;
+    state.scale_x = 1.0;
+    state.scale_y = 1.0;
+}
+
+fn set_rotation_gesture(state, degrees) {
+    state.rotation_degrees = wrap_degrees(degrees);
+    let radians = state.rotation_degrees * (3.141592653589793 / 180.0);
+    state.gesture = pivot_transform(state, rx::mat4_rotation_z(radians));
+}
+
+fn set_scale_gesture(state, sx, sy) {
+    state.scale_x = sx;
+    state.scale_y = sy;
+    state.gesture = pivot_transform(state, rx::mat4_scale(sx, sy));
+}
+
+/// Axis-aligned bounds of the transformed base selection. Only valid
+/// when `state.has_base`.
+fn transformed_bounds(state) {
+    let m = total_transform(state);
+    let (ax, ay) = rx::mat4_transform_point(m, state.bx1 as f64, state.by1 as f64);
+    let (bx, by) = rx::mat4_transform_point(m, state.bx2 as f64, state.by1 as f64);
+    let (cx, cy) = rx::mat4_transform_point(m, state.bx2 as f64, state.by2 as f64);
+    let (dx, dy) = rx::mat4_transform_point(m, state.bx1 as f64, state.by2 as f64);
+    let min_x = ax.min(bx).min(cx.min(dx)).floor();
+    let min_y = ay.min(by).min(cy.min(dy)).floor();
+    let max_x = ax.max(bx).max(cx.max(dx)).ceil();
+    let max_y = ay.max(by).max(cy.max(dy)).ceil();
+    let max_x = if max_x <= min_x { min_x + 1.0 } else { max_x };
+    let max_y = if max_y <= min_y { min_y + 1.0 } else { max_y };
+    (min_x as i64, min_y as i64, max_x as i64, max_y as i64)
+}
+
+fn sync_selection(state, rx) {
+    if !state.has_base {
+        return;
+    }
+    let (x1, y1, x2, y2) = transformed_bounds(state);
+    rx.set_selection(x1, y1, x2, y2);
+}
+
+fn restore_base_selection(state, rx) {
+    if state.pasted_once || !state.has_base {
+        return;
+    }
+    rx.set_selection(state.bx1, state.by1, state.bx2, state.by2);
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+fn enter_gesture_mode(state, rx, mode, other) {
+    let sel = rx.selection();
+    if sel.is_none() {
+        return;
+    }
+    if state.in_progress && rx.mode() == other {
+        commit_gesture(state);
+    }
+    if rx.mode() != mode && rx.mode() != other {
+        // Hard reset: snapshot the selection, clear its source rect.
+        let (x1, y1, x2, y2) = sel.unwrap();
+        state.dragging = false;
+        state.in_progress = true;
+        state.pasted_once = false;
+        state.rotation_degrees = 0.0;
+        state.scale_x = 1.0;
+        state.scale_y = 1.0;
+        state.committed = rx::mat4_identity();
+        state.gesture = rx::mat4_identity();
+        state.has_base = true;
+        state.bx1 = x1;
+        state.by1 = y1;
+        state.bx2 = x2;
+        state.by2 = y2;
+        state.has_pivot = true;
+        state.pivot_x = (x1 + x2) as f64 / 2.0;
+        state.pivot_y = (y1 + y2) as f64 / 2.0;
+        state.active_view_id = rx.active_view_id();
+
+        let r = rx::rect(x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+        let pixels = rx.view_pixels(state.active_view_id, r);
+        if pixels.is_none() {
+            state.in_progress = false;
+            return;
+        }
+        let w = if x2 > x1 { x2 - x1 } else { x1 - x2 };
+        let h = if y2 > y1 { y2 - y1 } else { y1 - y2 };
+        let clipboard = rx.create_texture(w, h).unwrap();
+        clipboard.upload(pixels.unwrap());
+        state.clipboard = clipboard;
+        rx.clear_view_rect(r);
+        rx.touch_view(state.active_view_id);
+    }
+    rx.switch_mode(mode);
+}
+
+pub fn selection_rotate(state, rx, args) {
+    enter_gesture_mode(state, rx, ROTATION_MODE, SCALE_MODE);
+}
+
+pub fn selection_scale(state, rx, args) {
+    enter_gesture_mode(state, rx, SCALE_MODE, ROTATION_MODE);
+}
+
+pub fn rotate_set(state, rx, args) {
+    if !state.in_progress || rx.mode() != ROTATION_MODE {
+        return;
+    }
+    set_rotation_gesture(state, args[0]);
+    state.dragging = false;
+}
+
+pub fn rotate_add(state, rx, args) {
+    if !state.in_progress || rx.mode() != ROTATION_MODE {
+        return;
+    }
+    set_rotation_gesture(state, wrap_degrees(state.rotation_degrees + args[0]));
+    state.dragging = false;
+}
+
+pub fn scale_set(state, rx, args) {
+    if !state.in_progress || rx.mode() != SCALE_MODE {
+        return;
+    }
+    set_scale_gesture(state, args[0], args[1]);
+    state.dragging = false;
+}
+
+pub fn scale_add(state, rx, args) {
+    if !state.in_progress || rx.mode() != SCALE_MODE {
+        return;
+    }
+    set_scale_gesture(state, state.scale_x + args[0], state.scale_y + args[1]);
+    state.dragging = false;
+}
+
+pub fn apply(state, rx, args) {
+    if !state.in_progress {
+        return;
+    }
+    state.apply_queued = true;
+    rx.touch_view(state.active_view_id);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+pub fn unload(state, rx) {
+    if !state.in_progress {
+        return;
+    }
+    restore_base_selection(state, rx);
+    if !state.pasted_once {
+        rx.damage_view(state.active_view_id);
+    }
+    let mode = rx.mode();
+    if mode == ROTATION_MODE || mode == SCALE_MODE {
+        rx.switch_mode("normal");
+    }
+}
+
+pub fn switch_mode(state, rx) {
+    if !state.in_progress {
+        return;
+    }
+    let mode = rx.mode();
+    if mode != "command" && mode != ROTATION_MODE && mode != SCALE_MODE {
+        restore_base_selection(state, rx);
+        state.in_progress = false;
+        if !state.pasted_once {
+            rx.damage_view(state.active_view_id);
+        }
+        if mode != "visual" {
+            rx.clear_selection();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+pub fn mouse_input(state, rx, button, input) {
+    let mode = rx.mode();
+    if mode != ROTATION_MODE && mode != SCALE_MODE {
+        return;
+    }
+    let (cx, cy) = rx.cursor();
+
+    // Right-click: move the pivot between gestures.
+    if input == "pressed" && button == "right" && !state.dragging {
+        let (px, py) = rx.active_view_coords(cx, cy);
+        state.has_pivot = true;
+        state.pivot_x = px;
+        state.pivot_y = py;
+        return;
+    }
+
+    if input == "pressed" && button == "left" {
+        commit_gesture(state);
+        state.dragging = true;
+        state.drag_x = cx;
+        state.drag_y = cy;
+    }
+    if input == "released" && button == "left" {
+        if state.dragging {
+            commit_gesture(state);
+        }
+        state.dragging = false;
+    }
+}
+
+pub fn cursor_moved(state, rx, x, y) {
+    if !state.dragging || !state.has_pivot {
+        return;
+    }
+    let mode = rx.mode();
+    if mode != ROTATION_MODE && mode != SCALE_MODE {
+        return;
+    }
+
+    let (px, py) = pivot_session(state, rx);
+    let (cx, cy) = rx.session_coords(x, y);
+
+    if mode == ROTATION_MODE {
+        let v1x = state.drag_x - px;
+        let v1y = state.drag_y - py;
+        let v2x = cx - px;
+        let v2y = cy - py;
+        let dot = v1x * v2x + v1y * v2y;
+        let det = v1x * v2y - v1y * v2x;
+        let degrees = rx::atan2(det, dot) * (180.0 / 3.141592653589793);
+        set_rotation_gesture(state, degrees);
+    } else {
+        let dsx = state.drag_x - px;
+        let dsy = state.drag_y - py;
+        let d_start = (dsx * dsx + dsy * dsy).sqrt();
+        let dnx = cx - px;
+        let dny = cy - py;
+        let d_now = (dnx * dnx + dny * dny).sqrt();
+        if d_start > 0.001 {
+            let s = d_now / d_start;
+            set_scale_gesture(state, s, s);
+        }
+    }
+}
+
+/// The pivot in session coordinates.
+fn pivot_session(state, rx) {
+    let view = active_view(state, rx);
+    let (ox, oy) = rx.offset();
+    (
+        state.pivot_x * view.zoom + ox + view.offset_x,
+        state.pivot_y * view.zoom + oy + view.offset_y,
+    )
+}
+
+fn active_view(state, rx) {
+    let found = ();
+    for v in rx.views() {
+        if v.id == rx.active_view_id() {
+            found = v;
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// Draw & shade
+// ---------------------------------------------------------------------------
+
+pub fn draw(state, rx) {
+    let mode = rx.mode();
+    if mode != ROTATION_MODE && mode != SCALE_MODE {
+        return;
+    }
+    if state.in_progress {
+        sync_selection(state, rx);
+    }
+
+    let pink = rx::rgb(0xff, 0x33, 0x66);
+    let algo = rx.setting("rotate-scale/algo");
+    let algo = if algo is String { algo } else { "" };
+    if algo == "" {
+        rx.draw_text("Algorithm: nearest neighbor (default)", 10.0, 86.0, pink);
+    } else {
+        rx.draw_text(`Algorithm: ${algo}`, 10.0, 86.0, pink);
+    }
+    if mode == ROTATION_MODE {
+        rx.draw_text(`Angle: ${state.rotation_degrees}`, 10.0, 66.0, pink);
+    } else {
+        rx.draw_text(`Scale: ${state.scale_x}, ${state.scale_y}`, 10.0, 66.0, pink);
+    }
+
+    if !state.has_pivot {
+        return;
+    }
+    let (x, y) = pivot_session(state, rx);
+    let color = if state.dragging {
+        rx::rgb(0xff, 0xff, 0xff)
+    } else {
+        rx::rgb(0xff, 0xff, 0x00)
+    };
+    rx.draw_line((x - PIVOT_HALF, y), (x + PIVOT_HALF, y), color);
+    rx.draw_line((x, y - PIVOT_HALF), (x, y + PIVOT_HALF), color);
+}
+
+pub fn shade(state, rx, encoder) {
+    if !state.in_progress || !state.has_base {
+        return;
+    }
+    let to_view = state.apply_queued;
+    state.apply_queued = false;
+    if to_view {
+        state.pasted_once = true;
+    }
+
+    let view = active_view(state, rx);
+    let dst = rx::rect(
+        state.bx1 as f64,
+        state.by1 as f64,
+        state.bx2 as f64,
+        state.by2 as f64,
+    );
+    let opacity = if to_view { 1.0 } else { 0.9 };
+    let transform = total_transform(state);
+
+    let algo = rx.setting("rotate-scale/algo");
+    let algo = if algo is String { algo } else { "" };
+
+    if algo != "" && to_view {
+        rx.call_plugin(
+            algo,
+            "render_pass",
+            [encoder, transform, state.active_view_id, state.clipboard, dst, view.width, view.height],
+        )
+        .unwrap();
+        return;
+    }
+
+    let tbg = rx.create_transform_bind_group(view.width, view.height, transform).unwrap();
+    let sbg = rx.create_texture_bind_group(state.clipboard).unwrap();
+    let verts = rx.create_sprite_vertices(state.clipboard, dst, rx::rgb(255, 255, 255), opacity).unwrap();
+
+    let pass = if to_view {
+        encoder.begin_view_pass("rotate-scale", state.active_view_id, "load").unwrap()
+    } else {
+        encoder.begin_staging_pass("rotate-scale", state.active_view_id, "load").unwrap()
+    };
+    pass.set_pipeline(state.nearest).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, verts).unwrap();
+    pass.draw(verts.count(), 1).unwrap();
+}
