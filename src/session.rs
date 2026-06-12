@@ -593,6 +593,13 @@ impl Settings {
             Err(format!("no such setting `{}`", k))
         }
     }
+
+    /// Declare a setting if it doesn't exist yet (used by plugins for
+    /// settings they own). Declared settings are `:set`-able like
+    /// builtins. No-op if the setting already exists.
+    pub fn declare(&mut self, k: &str, v: Value) {
+        self.map.entry(k.to_string()).or_insert(v);
+    }
 }
 
 impl Default for Settings {
