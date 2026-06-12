@@ -1,0 +1,73 @@
+// Fixture plugin: P26 readback & file write. :ex/comp composites
+// max(red checker, blue checker) into an 8x8 target GPU-side; :ex/save
+// (a separate, later command — texture_pixels is a command-handler
+// tool and same-frame readback would be stale) reads it back, writes
+// /tmp/rx-script-export.png, and probes two adjacent texels into the
+// message line: max() of the offset checkers is magenta everywhere,
+// so both probes read 255,0,255,255.
+pub fn init(rx) {
+    let wgsl = rx.read_file("export.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_max", 2).unwrap();
+
+    let a = rx.create_texture(8, 8).unwrap();
+    let data = Bytes::new();
+    for i in 0..64 {
+        if (i % 8 + i / 8) % 2 == 0 {
+            data.extend(b"\xff\x00\x00\xff");
+        } else {
+            data.extend(b"\x00\x00\x00\xff");
+        }
+    }
+    a.upload(data);
+
+    let b = rx.create_texture(8, 8).unwrap();
+    let data = Bytes::new();
+    for i in 0..64 {
+        if (i % 8 + i / 8) % 2 == 0 {
+            data.extend(b"\x00\x00\xff\xff");
+        } else {
+            data.extend(b"\xff\x00\xff\xff");
+        }
+    }
+    b.upload(data);
+
+    let target = rx.create_texture(8, 8).unwrap();
+
+    rx.register_command("ex/comp", [], "Composite the checkers on the GPU", comp);
+    rx.register_command("ex/save", [], "Read back and write the PNG", save);
+    #{ pipeline, a, b, target, pending: false }
+}
+
+pub fn comp(state, rx, args) {
+    state.pending = true;
+}
+
+pub fn save(state, rx, args) {
+    let px = rx.texture_pixels(state.target).unwrap();
+    // Probe before write_png consumes the bytes.
+    let probe = `a=${px[0]},${px[1]},${px[2]},${px[3]} b=${px[4]},${px[5]},${px[6]},${px[7]}`;
+    let ok = rx.write_png("/tmp/rx-script-export.png", 8, 8, px);
+    rx.message(`save ${ok} ${probe}`);
+}
+
+pub fn shade(state, rx, encoder) {
+    if !state.pending {
+        return;
+    }
+    state.pending = false;
+    let tbg = rx.create_transform_bind_group(8, 8, rx::mat4_identity()).unwrap();
+    let v = rx.create_sprite_vertices(
+        state.a,
+        rx::rect(0.0, 0.0, 8.0, 8.0),
+        rx::rgb(255, 255, 255),
+        1.0,
+    ).unwrap();
+    let pass = encoder.begin_render_pass("comp", state.target, "clear").unwrap();
+    pass.set_pipeline(state.pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, rx.create_texture_bind_group(state.a).unwrap()).unwrap();
+    pass.set_bind_group(2, rx.create_texture_bind_group(state.b).unwrap()).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+}

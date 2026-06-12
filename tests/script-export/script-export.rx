@@ -1,0 +1,15 @@
+-- Exercises P26: readback & file write. :ex/comp composites two CPU
+-- textures into a target on the GPU (shade stage); :ex/save — a later
+-- command, past the same-frame staleness window — reads the target
+-- back with texture_pixels, writes it with write_png, and posts a
+-- pixel probe to the message line. The digest asserts the messages;
+-- the harness checks the written file.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff
