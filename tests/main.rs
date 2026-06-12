@@ -102,6 +102,11 @@ fn layers() {
 }
 
 #[test]
+fn layers_active() {
+    test("layers-active");
+}
+
+#[test]
 fn ui() {
     test("ui");
 }

@@ -1,0 +1,107 @@
+00300 0001500 keyboard/input v pressed
+00300 0001500 char/received 'v'
+00312 0001560 keyboard/input v released
+00360 0001800 keyboard/input \ pressed
+00360 0001800 char/received '\'
+00372 0001860 keyboard/input \ released
+00420 0002100 keyboard/input 1 pressed
+00420 0002100 char/received '1'
+00432 0002160 keyboard/input 1 released
+00480 0002400 keyboard/input <esc> pressed
+00492 0002460 keyboard/input <esc> released
+00540 0002700 keyboard/input a pressed
+00540 0002700 char/received 'a'
+00552 0002760 keyboard/input a released
+00600 0003000 keyboard/input n pressed
+00600 0003000 char/received 'n'
+00612 0003060 keyboard/input n released
+00660 0003300 keyboard/input v pressed
+00660 0003300 char/received 'v'
+00672 0003360 keyboard/input v released
+00720 0003600 keyboard/input \ pressed
+00720 0003600 char/received '\'
+00732 0003660 keyboard/input \ released
+00780 0003900 keyboard/input 2 pressed
+00780 0003900 char/received '2'
+00792 0003960 keyboard/input 2 released
+00840 0004200 keyboard/input <esc> pressed
+00852 0004260 keyboard/input <esc> released
+00900 0004500 keyboard/input x pressed
+00900 0004500 char/received 'x'
+00912 0004560 keyboard/input x released
+00960 0004800 keyboard/input u pressed
+00960 0004800 char/received 'u'
+00972 0004860 keyboard/input u released
+01020 0005100 keyboard/input n pressed
+01020 0005100 char/received 'n'
+01032 0005160 keyboard/input n released
+01080 0005400 keyboard/input v pressed
+01080 0005400 char/received 'v'
+01092 0005460 keyboard/input v released
+01140 0005700 keyboard/input \ pressed
+01140 0005700 char/received '\'
+01152 0005760 keyboard/input \ released
+01200 0006000 keyboard/input e pressed
+01200 0006000 char/received 'e'
+01212 0006060 keyboard/input e released
+01260 0006300 keyboard/input <esc> pressed
+01272 0006360 keyboard/input <esc> released
+01320 0006600 keyboard/input p pressed
+01320 0006600 char/received 'p'
+01332 0006660 keyboard/input p released
+01380 0006900 keyboard/input v pressed
+01380 0006900 char/received 'v'
+01392 0006960 keyboard/input v released
+01440 0007200 keyboard/input \ pressed
+01440 0007200 char/received '\'
+01452 0007260 keyboard/input \ released
+01500 0007500 keyboard/input e pressed
+01500 0007500 char/received 'e'
+01512 0007560 keyboard/input e released
+01560 0007800 keyboard/input <esc> pressed
+01572 0007860 keyboard/input <esc> released
+01620 0008100 keyboard/input v pressed
+01620 0008100 char/received 'v'
+01632 0008160 keyboard/input v released
+01680 0008400 keyboard/input \ pressed
+01680 0008400 char/received '\'
+01692 0008460 keyboard/input \ released
+01740 0008700 keyboard/input 1 pressed
+01740 0008700 char/received '1'
+01752 0008760 keyboard/input 1 released
+01800 0009000 keyboard/input <esc> pressed
+01812 0009060 keyboard/input <esc> released
+01860 0009300 keyboard/input n pressed
+01860 0009300 char/received 'n'
+01872 0009360 keyboard/input n released
+01920 0009600 keyboard/input v pressed
+01920 0009600 char/received 'v'
+01932 0009660 keyboard/input v released
+01980 0009900 keyboard/input \ pressed
+01980 0009900 char/received '\'
+01992 0009960 keyboard/input \ released
+02040 0010200 keyboard/input 2 pressed
+02040 0010200 char/received '2'
+02052 0010260 keyboard/input 2 released
+02100 0010500 keyboard/input <esc> pressed
+02112 0010560 keyboard/input <esc> released
+02160 0010800 keyboard/input p pressed
+02160 0010800 char/received 'p'
+02172 0010860 keyboard/input p released
+02220 0011100 keyboard/input v pressed
+02220 0011100 char/received 'v'
+02232 0011160 keyboard/input v released
+02280 0011400 keyboard/input \ pressed
+02280 0011400 char/received '\'
+02292 0011460 keyboard/input \ released
+02340 0011700 keyboard/input y pressed
+02340 0011700 char/received 'y'
+02352 0011760 keyboard/input y released
+02400 0012000 keyboard/input n pressed
+02400 0012000 char/received 'n'
+02412 0012060 keyboard/input n released
+02460 0012300 keyboard/input o pressed
+02460 0012300 char/received 'o'
+02472 0012360 keyboard/input o released
+02520 0012600 keyboard/input <esc> pressed
+02532 0012660 keyboard/input <esc> released

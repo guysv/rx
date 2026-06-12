@@ -165,6 +165,8 @@ pub struct View<R> {
     /// Number of layers. Layers are vertical strips of the view sheet,
     /// as frames are horizontal strips.
     pub nlayers: usize,
+    /// The active layer: the strip that writes route to.
+    pub active_layer: usize,
     /// View offset relative to the session workspace.
     pub offset: Vector2<f32>,
     /// Identifier.
@@ -248,6 +250,7 @@ impl<R> View<R> {
             fw,
             fh,
             nlayers: 1,
+            active_layer: 0,
             offset: Vector2::zero(),
             zoom: 1.,
             ops: Vec::new(),
@@ -314,10 +317,11 @@ impl<R> View<R> {
     }
 
     /// Extend the view by one frame, by cloning an existing frame,
-    /// by index.
+    /// by index. The whole sheet column is cloned: the frame's cel in
+    /// every layer.
     pub fn extend_clone(&mut self, index: i32) {
         let width = self.width() as f32;
-        let (fw, fh) = (self.fw as f32, self.fh as f32);
+        let (fw, sh) = (self.fw as f32, self.sheet_height() as f32);
 
         let index = if index == -1 {
             self.animation.len() - 1
@@ -327,8 +331,8 @@ impl<R> View<R> {
 
         self.extend();
         self.ops.push(ViewOp::Blit(
-            Rect::new(fw * index as f32, 0., fw * (index + 1) as f32, fh),
-            Rect::new(width, 0., width + fw, fh),
+            Rect::new(fw * index as f32, 0., fw * (index + 1) as f32, sh),
+            Rect::new(width, 0., width + fw, sh),
         ));
     }
 
@@ -345,7 +349,18 @@ impl<R> View<R> {
         // Don't allow the view to have zero layers.
         if self.nlayers > 1 {
             self.nlayers -= 1;
+            self.active_layer = self.active_layer.min(self.nlayers - 1);
             self.resized();
+        }
+    }
+
+    /// Activate a layer: subsequent writes route to its strip.
+    pub fn activate_layer(&mut self, n: usize) -> bool {
+        if n < self.nlayers {
+            self.active_layer = n;
+            true
+        } else {
+            false
         }
     }
 
@@ -562,6 +577,7 @@ impl<R> View<R> {
         self.fw = extent.fw;
         self.fh = extent.fh;
         self.nlayers = extent.nlayers;
+        self.active_layer = self.active_layer.min(extent.nlayers - 1);
 
         let mut frames = Vec::new();
         let origin = Rect::origin(self.fw as f32, self.fh as f32);
@@ -574,10 +590,23 @@ impl<R> View<R> {
 }
 
 impl View<ViewResource> {
-    /// Get the color at the given view coordinate.
+    /// Get the *composited* color at the given display coordinate: the
+    /// topmost non-transparent layer wins, falling back to the bottom
+    /// layer's pixel.
     pub fn color_at(&self, p: ViewCoords<u32>) -> Option<&Rgba8> {
         let (snapshot, pixels) = self.resource.layer.current_snapshot();
-        snapshot.coord_to_index(p).and_then(|idx| pixels.get(idx))
+
+        let mut color = None;
+        for n in (0..self.nlayers).rev() {
+            let q = ViewCoords::new(p.x, p.y + n as u32 * self.fh);
+            if let Some(c) = snapshot.coord_to_index(q).and_then(|idx| pixels.get(idx)) {
+                if c.a > 0 {
+                    return Some(c);
+                }
+                color = Some(c);
+            }
+        }
+        color
     }
 
     /// Restore a view snapshot (undo/redo an edit).

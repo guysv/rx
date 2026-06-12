@@ -73,6 +73,9 @@ pub enum Command {
     LayerAdd,
     LayerClone(i32),
     LayerRemove,
+    LayerNext,
+    LayerPrev,
+    LayerSet(i32),
 
     // Palette
     PaletteAdd(Rgba8),
@@ -186,6 +189,9 @@ impl fmt::Display for Command {
             Self::LayerAdd => write!(f, "Add a blank layer above the view's layers"),
             Self::LayerClone(i) => write!(f, "Clone layer {} and add it above the view's layers", i),
             Self::LayerRemove => write!(f, "Remove the top layer of the view"),
+            Self::LayerNext => write!(f, "Activate the layer above the active one"),
+            Self::LayerPrev => write!(f, "Activate the layer below the active one"),
+            Self::LayerSet(i) => write!(f, "Activate layer {}", i),
             Self::FramePrev => write!(f, "Navigate to previous frame"),
             Self::FrameNext => write!(f, "Navigate to next frame"),
             Self::Noop => write!(f, "No-op"),
@@ -278,6 +284,9 @@ impl From<Command> for String {
             Command::LayerAdd => format!("layer/add"),
             Command::LayerClone(i) => format!("layer/dup {}", i),
             Command::LayerRemove => format!("layer/remove"),
+            Command::LayerNext => format!("layer/next"),
+            Command::LayerPrev => format!("layer/prev"),
+            Command::LayerSet(i) => format!("layer/set {}", i),
             Command::Export(None, path) => format!("export {}", path),
             Command::Export(Some(s), path) => format!("export @{}x {}", s, path),
             Command::Noop => format!(""),
@@ -1025,6 +1034,16 @@ impl Default for Commands {
                 "Remove the top layer from the active view",
                 |p| p.value(Command::LayerRemove),
             )
+            .command("layer/next", "Activate the layer above", |p| {
+                p.value(Command::LayerNext)
+            })
+            .command("layer/prev", "Activate the layer below", |p| {
+                p.value(Command::LayerPrev)
+            })
+            .command("layer/set", "Activate layer <index>", |p| {
+                p.then(integer::<i32>().label("<index>"))
+                    .map(|(_, index)| Command::LayerSet(index))
+            })
             .command("f/prev", "Navigate to previous frame", |p| {
                 p.value(Command::FramePrev)
             })

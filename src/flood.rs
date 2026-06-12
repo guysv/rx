@@ -52,12 +52,17 @@ impl FloodFiller {
         replacement_color: Rgba8,
     ) -> Option<FloodFiller> {
         let (snapshot, pixels) = view.layer.current_snapshot();
-        let bounds = snapshot.extent.rect();
-        let grid = Grid::new(
-            pixels.to_vec(),
-            bounds.width() as usize,
-            bounds.height() as usize,
-        );
+        let extent = snapshot.extent;
+        let (w, fh) = (extent.width() as usize, extent.fh as usize);
+
+        // The fill operates on the active layer's strip alone: the seed
+        // is display-space, and the fill must not bleed across strips.
+        // Byte row 0 is the sheet top, so layer n sits nlayers - 1 - n
+        // strips down. The output shapes are display-space too — the
+        // final-pass transform routes them back to the strip.
+        let n = view.active_layer.min(extent.nlayers - 1);
+        let offset = (extent.nlayers - 1 - n) * fh * w;
+        let grid = Grid::new(pixels[offset..offset + fh * w].to_vec(), w, fh);
 
         let starting_point = Point2::new(
             starting_point.x as usize,
