@@ -1,0 +1,14 @@
+-- Exercises P13: script-tier bindings. In normal mode `.` zooms (the
+-- view visibly grows; default `map . :zoom +`). In the plugin's funky
+-- mode, its script-tier binding for `.` wins: a message appears and no
+-- zoom happens. After escape, `.` zooms again.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+-- Make the view visible so zooming is loud in the digest.
+v/fill #ffffff

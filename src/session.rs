@@ -389,11 +389,35 @@ impl fmt::Display for Input {
     }
 }
 
+/// Priority tier of a key binding. Higher tier wins when multiple
+/// bindings match the same input.
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
+pub enum BindingTier {
+    /// From `:map` — applies to Normal + Visual.
+    #[default]
+    General,
+    /// From `:map/normal`, `:map/visual`, `:map/help` — applies to a
+    /// fixed set of builtin modes.
+    ModeSpecific(Vec<Mode>),
+    /// From `:map/script "name"` (or `rx.bind`) — applies to script
+    /// modes whose name starts with the binding's name.
+    Script(ModeString),
+}
+
+impl BindingTier {
+    /// Numeric priority for tier comparison. Higher value wins.
+    fn priority(&self) -> u8 {
+        match self {
+            Self::General => 0,
+            Self::ModeSpecific(_) => 1,
+            Self::Script(_) => 2,
+        }
+    }
+}
+
 /// A key binding.
 #[derive(PartialEq, Clone, Debug)]
 pub struct KeyBinding {
-    /// The `Mode`s this binding applies to.
-    pub modes: Vec<Mode>,
     /// Modifiers which must be held.
     pub modifiers: ModifiersState,
     /// Input expected to trigger the binding.
@@ -407,9 +431,32 @@ pub struct KeyBinding {
     /// How this key binding should be displayed to the user.
     /// If `None`, then this binding shouldn't be shown to the user.
     pub display: Option<String>,
+    /// Priority tier for this binding. Also carries mode information.
+    pub tier: BindingTier,
 }
 
 impl KeyBinding {
+    /// Check whether this binding applies to the given mode.
+    pub fn mode_matches(&self, mode: Mode) -> bool {
+        match &self.tier {
+            BindingTier::General => matches!(mode, Mode::Normal | Mode::Visual(_)),
+            BindingTier::ModeSpecific(modes) => modes.contains(&mode),
+            BindingTier::Script(name) => match mode {
+                Mode::Script(ref current) => current.as_str().starts_with(name.as_str()),
+                _ => false,
+            },
+        }
+    }
+
+    /// For script-tier bindings, the length of the mode-name prefix
+    /// (used for "longest prefix wins" ordering).
+    fn script_mode_match_len(&self) -> usize {
+        match &self.tier {
+            BindingTier::Script(name) => name.len() as usize,
+            _ => 0,
+        }
+    }
+
     fn is_match(
         &self,
         input: Input,
@@ -421,7 +468,7 @@ impl KeyBinding {
             (Input::Key(key), Input::Key(k)) => {
                 key == k
                     && self.state == state
-                    && self.modes.contains(&mode)
+                    && self.mode_matches(mode)
                     && (self.modifiers == modifiers
                         || state == InputState::Released
                         || key.is_modifier())
@@ -431,7 +478,7 @@ impl KeyBinding {
                 // because the others (especially <shift>) will most likely
                 // input a different character.
                 a == b
-                    && self.modes.contains(&mode)
+                    && self.mode_matches(mode)
                     && self.state == state
                     && self.modifiers.ctrl == modifiers.ctrl
             }
@@ -448,11 +495,19 @@ pub struct KeyBindings {
 
 impl KeyBindings {
     /// Add a key binding.
+    ///
+    /// Only replaces an existing binding with the same
+    /// `(input, state, modifiers, tier)`. The tier embeds the mode
+    /// information, so equality on it decides whether two bindings
+    /// occupy the same slot; bindings at different tiers coexist and
+    /// lookup picks the winner by priority.
     pub fn add(&mut self, binding: KeyBinding) {
-        for mode in binding.modes.iter() {
-            self.elems
-                .retain(|kb| !kb.is_match(binding.input, binding.state, binding.modifiers, *mode));
-        }
+        self.elems.retain(|kb| {
+            !(kb.input == binding.input
+                && kb.state == binding.state
+                && kb.modifiers == binding.modifiers
+                && kb.tier == binding.tier)
+        });
         self.elems.push(binding);
     }
 
@@ -464,7 +519,11 @@ impl KeyBindings {
         self.elems.is_empty()
     }
 
-    /// Find a key binding based on some input state.
+    /// Find the best key binding for some input state, by tier priority.
+    ///
+    /// When multiple bindings match, the highest tier wins. Among
+    /// script-tier bindings, the longest matching mode-name prefix wins.
+    /// Among equals, the last-added one wins (previous behavior).
     pub fn find(
         &self,
         input: Input,
@@ -472,11 +531,26 @@ impl KeyBindings {
         state: InputState,
         mode: Mode,
     ) -> Option<KeyBinding> {
-        self.elems
-            .iter()
-            .rev()
-            .cloned()
-            .find(|kb| kb.is_match(input, state, modifiers, mode))
+        let mut best: Option<(u8, usize, usize)> = None; // (priority, script_len, index)
+
+        for (i, kb) in self.elems.iter().enumerate() {
+            if !kb.is_match(input, state, modifiers, mode) {
+                continue;
+            }
+            let prio = kb.tier.priority();
+            let script_len = kb.script_mode_match_len();
+            let wins = match best {
+                Some((best_prio, best_slen, _)) => {
+                    prio > best_prio || (prio == best_prio && script_len >= best_slen)
+                }
+                None => true,
+            };
+            if wins {
+                best = Some((prio, script_len, i));
+            }
+        }
+
+        best.map(|(_, _, i)| self.elems[i].clone())
     }
 
     /// Iterate over all key bindings.
@@ -2128,15 +2202,25 @@ impl Session {
         let state = if repeat { InputState::Pressed } else { state };
 
         if let Some(key) = key {
-            // While the mouse is down, don't accept keyboard input.
-            if self.mouse_state == InputState::Pressed {
-                return;
-            }
-
             if state == InputState::Pressed {
                 repeat = repeat || !self.keys_pressed.insert(key);
             } else if state == InputState::Released {
                 if !self.keys_pressed.remove(&key) {
+                    return;
+                }
+            }
+
+            // While the mouse is down, don't accept keyboard input —
+            // except script-tier bindings, which plugins rely on during
+            // drag interactions (e.g. axis toggles while rotating).
+            if self.mouse_state == InputState::Pressed {
+                let binding = self
+                    .key_bindings
+                    .find(Input::Key(key), modifiers, state, self.mode);
+                if !matches!(
+                    binding.as_ref().map(|kb| &kb.tier),
+                    Some(BindingTier::Script(_))
+                ) {
                     return;
                 }
             }
@@ -2869,27 +2953,27 @@ impl Session {
                     input,
                     press,
                     release,
-                    modes,
+                    tier,
                 } = *map;
 
                 self.key_bindings.add(KeyBinding {
                     input,
-                    modes: modes.clone(),
                     command: press,
                     state: InputState::Pressed,
                     modifiers: platform::ModifiersState::default(),
                     is_toggle: release.is_some(),
                     display: Some(format!("{}", input)),
+                    tier: tier.clone(),
                 });
                 if let Some(cmd) = release {
                     self.key_bindings.add(KeyBinding {
                         input,
-                        modes,
                         command: cmd,
                         state: InputState::Released,
                         modifiers: platform::ModifiersState::default(),
                         is_toggle: true,
                         display: None,
+                        tier,
                     });
                 }
             }
@@ -3165,16 +3249,16 @@ mod test {
         let modifiers = Default::default();
 
         let kb1 = KeyBinding {
-            modes: vec![Mode::Normal],
             input: Input::Key(platform::Key::A),
             command: Command::Noop,
             is_toggle: false,
             display: None,
             modifiers,
             state,
+            tier: BindingTier::ModeSpecific(vec![Mode::Normal]),
         };
         let kb2 = KeyBinding {
-            modes: vec![Mode::Command],
+            tier: BindingTier::ModeSpecific(vec![Mode::Command]),
             ..kb1.clone()
         };
 
@@ -3195,7 +3279,7 @@ mod test {
 
         assert_eq!(kbs.len(), 2, "bindings can be overwritten");
         assert_eq!(
-            kbs.find(kb2.input, kb2.modifiers, kb2.state, kb2.modes[0]),
+            kbs.find(kb2.input, kb2.modifiers, kb2.state, Mode::Command),
             Some(kb3),
             "bindings can be overwritten"
         );
@@ -3204,13 +3288,13 @@ mod test {
     #[test]
     fn test_key_bindings_modifier() {
         let kb = KeyBinding {
-            modes: vec![Mode::Normal],
             input: Input::Key(platform::Key::Control),
             command: Command::Noop,
             is_toggle: false,
             display: None,
             modifiers: Default::default(),
             state: InputState::Pressed,
+            tier: BindingTier::ModeSpecific(vec![Mode::Normal]),
         };
 
         let mut kbs = KeyBindings::default();
@@ -3239,6 +3323,209 @@ mod test {
                 Mode::Normal
             ),
             Some(kb)
+        );
+    }
+
+    #[test]
+    fn test_tier_general_vs_mode_specific() {
+        // General binding (Normal + Visual); mode-specific for Visual
+        // only. In Normal, general wins; in Visual, mode-specific wins.
+        let mut kbs = KeyBindings::default();
+        let modifiers = ModifiersState::default();
+        let state = InputState::Pressed;
+
+        let general = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Noop,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::General,
+        };
+        let visual_specific = KeyBinding {
+            command: Command::Quit,
+            tier: BindingTier::ModeSpecific(vec![Mode::Visual(VisualState::selecting())]),
+            ..general.clone()
+        };
+
+        kbs.add(general.clone());
+        kbs.add(visual_specific.clone());
+
+        // Both coexist (different tiers).
+        assert_eq!(kbs.len(), 2);
+
+        assert_eq!(
+            kbs.find(Input::Key(platform::Key::A), modifiers, state, Mode::Normal),
+            Some(general),
+        );
+        assert_eq!(
+            kbs.find(
+                Input::Key(platform::Key::A),
+                modifiers,
+                state,
+                Mode::Visual(VisualState::selecting()),
+            ),
+            Some(visual_specific),
+        );
+    }
+
+    #[test]
+    fn test_tier_specialized_does_not_remove_general() {
+        // Adding a mode-specific binding must NOT remove a general one.
+        let mut kbs = KeyBindings::default();
+        let modifiers = ModifiersState::default();
+        let state = InputState::Pressed;
+
+        let general = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Noop,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::General,
+        };
+        kbs.add(general.clone());
+
+        let visual_specific = KeyBinding {
+            command: Command::Quit,
+            tier: BindingTier::ModeSpecific(vec![Mode::Visual(VisualState::selecting())]),
+            ..general.clone()
+        };
+        kbs.add(visual_specific);
+
+        assert_eq!(
+            kbs.find(Input::Key(platform::Key::A), modifiers, state, Mode::Normal),
+            Some(general),
+        );
+    }
+
+    #[test]
+    fn test_script_prefix_match() {
+        // Script bindings match by mode-name prefix; the longest
+        // matching prefix wins.
+        let mut kbs = KeyBindings::default();
+        let modifiers = ModifiersState::default();
+        let state = InputState::Pressed;
+
+        let foo_binding = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Noop,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::Script(ModeString::try_from_str("foo").unwrap()),
+        };
+        let foobar_binding = KeyBinding {
+            command: Command::Quit,
+            tier: BindingTier::Script(ModeString::try_from_str("foobar").unwrap()),
+            ..foo_binding.clone()
+        };
+
+        kbs.add(foo_binding.clone());
+        kbs.add(foobar_binding.clone());
+
+        // "foobaz" matches the "foo" prefix only.
+        assert_eq!(
+            kbs.find(
+                Input::Key(platform::Key::A),
+                modifiers,
+                state,
+                Mode::Script(ModeString::try_from_str("foobaz").unwrap()),
+            ),
+            Some(foo_binding),
+        );
+
+        // "foobar" matches both; the longer prefix wins.
+        assert_eq!(
+            kbs.find(
+                Input::Key(platform::Key::A),
+                modifiers,
+                state,
+                Mode::Script(ModeString::try_from_str("foobar").unwrap()),
+            ),
+            Some(foobar_binding),
+        );
+    }
+
+    #[test]
+    fn test_script_tier_beats_general() {
+        let mut kbs = KeyBindings::default();
+        let modifiers = ModifiersState::default();
+        let state = InputState::Pressed;
+
+        let general = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Noop,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::General,
+        };
+        let script = KeyBinding {
+            command: Command::Quit,
+            tier: BindingTier::Script(ModeString::try_from_str("mymode").unwrap()),
+            ..general.clone()
+        };
+
+        kbs.add(general.clone());
+        kbs.add(script.clone());
+
+        // Normal: general wins (script doesn't match Normal).
+        assert_eq!(
+            kbs.find(Input::Key(platform::Key::A), modifiers, state, Mode::Normal),
+            Some(general),
+        );
+
+        // The script mode: script tier wins.
+        assert_eq!(
+            kbs.find(
+                Input::Key(platform::Key::A),
+                modifiers,
+                state,
+                Mode::Script(ModeString::try_from_str("mymode").unwrap()),
+            ),
+            Some(script),
+        );
+    }
+
+    #[test]
+    fn test_replace_same_tier_same_key() {
+        // Re-adding a binding with the same tier replaces it.
+        let mut kbs = KeyBindings::default();
+        let modifiers = ModifiersState::default();
+        let state = InputState::Pressed;
+
+        let first = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Noop,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::ModeSpecific(vec![Mode::Normal]),
+        };
+        kbs.add(first);
+
+        let second = KeyBinding {
+            input: Input::Key(platform::Key::A),
+            command: Command::Quit,
+            is_toggle: false,
+            display: None,
+            modifiers,
+            state,
+            tier: BindingTier::ModeSpecific(vec![Mode::Normal]),
+        };
+        kbs.add(second.clone());
+
+        // Replaced, not duplicated.
+        assert_eq!(kbs.len(), 1);
+        assert_eq!(
+            kbs.find(Input::Key(platform::Key::A), modifiers, state, Mode::Normal),
+            Some(second),
         );
     }
 }
