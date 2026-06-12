@@ -1,0 +1,66 @@
+#!/bin/sh
+# Re-record a replay test's frame digest. See CLAUDE.md.
+#
+# Usage: scripts/record-digest tests/<name>
+#        scripts/record-digest plugins/<name>/test
+set -e
+
+dir=${1:?usage: record-digest <test-dir>}
+dir=${dir%/}
+stem=$(basename "$dir")
+toml=$dir/$stem.toml
+log=$(mktemp)
+
+width=$(sed -n 's/^width *= *//p' "$toml")
+height=$(sed -n 's/^height *= *//p' "$toml")
+
+cargo build --no-default-features
+
+# Pick the plugin dir the way tests/main.rs does: a `[plugins] load`
+# list gets the listed sample plugins (top-level files only) staged
+# together with any *.rune driver scripts from the test dir; otherwise
+# the test's own plugins/ fixture dir is used, if present.
+plugins=
+load=$(sed -n 's/^load *= *\[\(.*\)\]/\1/p' "$toml" | tr -d '"' | tr ',' ' ')
+if [ -n "$load" ]; then
+    name=$(basename "$(dirname "$dir")")
+    plugins=target/plugin-tests/$name
+    rm -rf "$plugins"
+    for p in $load; do
+        mkdir -p "$plugins/$p"
+        find "plugins/$p" -maxdepth 1 -type f -exec cp {} "$plugins/$p/" \;
+    done
+    for f in "$dir"/*.rune; do
+        [ -e "$f" ] && cp "$f" "$plugins/"
+    done
+elif [ -d "$dir/plugins" ]; then
+    plugins=$dir/plugins
+fi
+
+# rx lingers in the main loop after the replay completes: wait for the
+# digest to be written, then kill it.
+RUST_LOG=rx=info target/debug/rx --replay "$dir" -u "$dir/$stem.rx" \
+    ${plugins:+--plugin-dir "$plugins"} --headless --record-digests \
+    --width "$width" --height "$height" >"$log" 2>&1 &
+pid=$!
+for _ in $(seq 1 120); do
+    grep -q "digest saved" "$log" && break
+    sleep 1
+done
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+
+if ! grep -q "digest saved" "$log"; then
+    echo "record failed; log tail:" >&2
+    tail -20 "$log" >&2
+    exit 1
+fi
+
+# A digest silently locks in whatever rendered, including fixture
+# errors -- refuse a run that logged any.
+if grep -i -e "error" -e "disabled" "$log" >&2; then
+    echo "errors in the record run; digest not trustworthy ($log)" >&2
+    exit 1
+fi
+
+echo "$dir/$stem.digest: $(grep -c . "$dir/$stem.digest") unique frames"
