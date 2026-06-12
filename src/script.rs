@@ -1030,6 +1030,53 @@ impl Ctx {
         }
     }
 
+    /// Clear a rect of the active view to transparent. This is a
+    /// recorded paint (part of the same undoable edit as any other
+    /// paint this frame); scripts use it to erase the source region
+    /// before stamping a transformed copy.
+    #[rune::function]
+    fn clear_view_rect(&mut self, rect: &Rect) {
+        use crate::gfx::color::Rgba8;
+        use crate::gfx::rect::Rect as GfxRect;
+        use crate::gfx::shape2d::{Fill, Rotation, Shape, Stroke};
+        use crate::gfx::ZDepth;
+        use crate::session::{Blending, Effect};
+
+        let r = GfxRect::new(
+            rect.x1.min(rect.x2) as f32,
+            rect.y1.min(rect.y2) as f32,
+            rect.x1.max(rect.x2) as f32,
+            rect.y1.max(rect.y2) as f32,
+        );
+        let session = self.session_mut();
+        session.effects.extend_from_slice(&[
+            Effect::ViewBlendingChanged(Blending::Constant),
+            Effect::ViewPaintFinal(vec![Shape::Rectangle(
+                r,
+                ZDepth::default(),
+                Rotation::ZERO,
+                Stroke::NONE,
+                Fill::Solid(Rgba8::TRANSPARENT.into()),
+            )]),
+        ]);
+        if let Some(v) = session.views.active_mut() {
+            v.touch();
+        }
+    }
+
+    /// Re-render a view's texture from its recorded snapshot,
+    /// discarding any unrecorded GPU-side paint (e.g. a preview a
+    /// script rendered into the view and now wants gone).
+    #[rune::function]
+    fn damage_view(&mut self, id: i64) {
+        use crate::session::Effect;
+        use crate::view::ViewId;
+
+        self.session_mut()
+            .effects
+            .push(Effect::ViewDamaged(ViewId::from(id as u16), None));
+    }
+
     /// Read a view's pixels in the given rect (rgba8 bytes, row-major).
     /// The rect is clamped to the view; `None` if the view doesn't
     /// exist or the rect is empty.
@@ -1744,6 +1791,8 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::fg)?;
     m.function_meta(Ctx::touch_view)?;
     m.function_meta(Ctx::view_pixels)?;
+    m.function_meta(Ctx::clear_view_rect)?;
+    m.function_meta(Ctx::damage_view)?;
     m.function_meta(Ctx::message)?;
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
@@ -3910,6 +3959,45 @@ mod test {
         for px in pixels.chunks(4) {
             assert_eq!(px, &[0x00, 0xff, 0xff, 0xff]);
         }
+    }
+
+    #[test]
+    fn view_interop_effects() {
+        use crate::session::{Blending, Effect};
+        use crate::view::FileStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("interop", [], "Test interop", interop);
+                #{}
+            }
+            pub fn interop(state, rx, args) {
+                rx.clear_view_rect(rx::rect(4.0, 4.0, 12.0, 12.0));
+                rx.damage_view(rx.active_view_id());
+            }
+            "#,
+        );
+        let mut session = session.with_blank(FileStatus::NoFile, 32, 32);
+        session.effects.clear();
+
+        host.dispatch_command(&mut session, "interop", "");
+
+        // The rect clear is a recorded paint: constant blending + a
+        // transparent fill, and the view is touched (dirty -> snapshot).
+        assert!(matches!(
+            session.effects[0],
+            Effect::ViewBlendingChanged(Blending::Constant)
+        ));
+        match &session.effects[1] {
+            Effect::ViewPaintFinal(shapes) => assert_eq!(shapes.len(), 1),
+            other => panic!("expected ViewPaintFinal, got {:?}", other),
+        }
+        assert!(matches!(session.effects[2], Effect::ViewDamaged(_, None)));
+        assert!(session.views.active().unwrap().is_dirty());
     }
 
     #[test]
