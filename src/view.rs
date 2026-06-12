@@ -45,6 +45,9 @@ impl fmt::Display for ViewId {
 /// These coordinates are relative to the bottom left corner of the view.
 pub type ViewCoords<T> = Point<ViewExtent, T>;
 
+/// Maximum view sheet dimension, set by the GPU texture size limit.
+pub const MAX_SHEET_DIM: u32 = 8192;
+
 /// View extent information.
 ///
 /// The extent describes the view *sheet*: frames are horizontal strips
@@ -326,6 +329,46 @@ impl<R> View<R> {
         self.ops.push(ViewOp::Blit(
             Rect::new(fw * index as f32, 0., fw * (index + 1) as f32, fh),
             Rect::new(width, 0., width + fw, fh),
+        ));
+    }
+
+    /// Extend the view by one layer: a new transparent strip above the
+    /// existing ones. The sheet grows by one strip height; the display
+    /// footprint is unchanged.
+    pub fn extend_layer(&mut self) {
+        self.nlayers += 1;
+        self.resized();
+    }
+
+    /// Shrink the view by one layer, removing the top strip.
+    pub fn shrink_layer(&mut self) {
+        // Don't allow the view to have zero layers.
+        if self.nlayers > 1 {
+            self.nlayers -= 1;
+            self.resized();
+        }
+    }
+
+    /// Extend the view by one layer, cloning an existing layer's strip,
+    /// by index. `-1` clones the top layer.
+    pub fn extend_clone_layer(&mut self, index: i32) {
+        let index = if index == -1 {
+            self.nlayers - 1
+        } else {
+            index as usize
+        };
+
+        // The source strip rect is taken from the pre-extend extent: the
+        // blit reads the current snapshot, which doesn't have the new
+        // strip yet.
+        let src = self.extent().layer(index).map(|n| n as f32);
+        let dst_y = self.sheet_height() as f32;
+        let w = self.width() as f32;
+
+        self.extend_layer();
+        self.ops.push(ViewOp::Blit(
+            src,
+            Rect::new(0., dst_y, w, dst_y + self.fh as f32),
         ));
     }
 
@@ -931,6 +974,37 @@ mod tests {
         assert_eq!(v.extent(), ViewExtent::layered(16, 12, 3, 3));
         assert!(v.slice(1));
         assert_eq!(v.extent(), ViewExtent::layered(48, 12, 1, 3));
+    }
+
+    #[test]
+    fn test_view_layer_lifecycle() {
+        let mut v: View<()> = View::new(ViewId(1), FileStatus::NoFile, 16, 12, 2, ());
+
+        v.extend_layer();
+        assert_eq!(v.nlayers, 2);
+        assert_eq!(v.height(), 12);
+        assert_eq!(v.sheet_height(), 24);
+        // The resize op carries sheet dimensions.
+        assert!(matches!(v.ops.last(), Some(ViewOp::Resize(32, 24))));
+
+        // Clone layer 0: the blit reads layer 0's strip and writes the
+        // new top strip (above the two existing ones), in y-up coords.
+        v.extend_clone_layer(0);
+        assert_eq!(v.nlayers, 3);
+        match v.ops.last() {
+            Some(ViewOp::Blit(src, dst)) => {
+                assert_eq!(*src, Rect::new(0., 0., 32., 12.));
+                assert_eq!(*dst, Rect::new(0., 24., 32., 36.));
+            }
+            op => panic!("expected a blit op, got {:?}", op),
+        }
+
+        // The top layer never goes away.
+        v.shrink_layer();
+        v.shrink_layer();
+        assert_eq!(v.nlayers, 1);
+        v.shrink_layer();
+        assert_eq!(v.nlayers, 1);
     }
 }
 

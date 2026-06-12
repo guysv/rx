@@ -312,47 +312,72 @@ struct LayerData {
     vertex_count: u32,
 }
 
+/// Build a static vertex buffer from a sprite batch.
+fn sprite_vertex_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    batch: &sprite2d::Batch,
+    label: &str,
+) -> (wgpu::Buffer, u32) {
+    let verts: Vec<Sprite2dVertex> = batch
+        .vertices()
+        .iter()
+        .map(|v| Sprite2dVertex {
+            position: [v.position.x, v.position.y, v.position.z],
+            uv: [v.uv.x, v.uv.y],
+            color: [v.color.r, v.color.g, v.color.b, v.color.a],
+            opacity: v.opacity,
+        })
+        .collect();
+
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (verts.len() * std::mem::size_of::<Sprite2dVertex>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&verts));
+
+    (vertex_buffer, verts.len() as u32)
+}
+
 impl LayerData {
+    /// `h` is the display (strip) height; `sheet_h` is the texture
+    /// height, one strip per layer.
     fn new(
         device: &wgpu::Device,
         w: u32,
         h: u32,
+        sheet_h: u32,
         pixels: Option<&[Rgba8]>,
         queue: &wgpu::Queue,
     ) -> Self {
-        let texture = Texture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let texture = Texture::new(device, w, sheet_h, wgpu::TextureFormat::Rgba8UnormSrgb);
 
-        // Create a quad vertex buffer for rendering this layer
-        let batch = sprite2d::Batch::singleton(
-            w,
-            h,
-            Rect::origin(w as f32, h as f32),
-            Rect::origin(w as f32, h as f32),
-            ZDepth::default(),
-            Rgba::TRANSPARENT,
-            1.,
-            Repeat::default(),
-        );
+        debug_assert!(sheet_h % h == 0, "the sheet is a whole number of strips");
+        let nlayers = (sheet_h / h) as usize;
 
-        let verts: Vec<Sprite2dVertex> = batch
-            .vertices()
-            .iter()
-            .map(|v| Sprite2dVertex {
-                position: [v.position.x, v.position.y, v.position.z],
-                uv: [v.uv.x, v.uv.y],
-                color: [v.color.r, v.color.g, v.color.b, v.color.a],
-                opacity: v.opacity,
-            })
-            .collect();
+        // One quad per layer strip, all mapped onto the display
+        // footprint. The bottom layer comes first so upper layers
+        // alpha-blend over it. Batch src rects are y-down texture
+        // coordinates: strip n (y-up) covers rows
+        // `sheet_h - (n+1)*h .. sheet_h - n*h`.
+        let mut batch = sprite2d::Batch::new(w, sheet_h);
+        for n in 0..nlayers {
+            let y2 = (sheet_h - n as u32 * h) as f32;
+            batch.add(
+                Rect::new(0., y2 - h as f32, w as f32, y2),
+                Rect::origin(w as f32, h as f32),
+                ZDepth::default(),
+                Rgba::TRANSPARENT,
+                1.,
+                Repeat::default(),
+            );
+        }
 
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("layer_vertex_buffer"),
-            size: (verts.len() * std::mem::size_of::<Sprite2dVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        let (vertex_buffer, vertex_count) =
+            sprite_vertex_buffer(device, queue, &batch, "layer_vertex_buffer");
 
         // Upload initial pixels if provided
         if let Some(pixels) = pixels {
@@ -368,11 +393,11 @@ impl LayerData {
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * w),
-                    rows_per_image: Some(h),
+                    rows_per_image: Some(sheet_h),
                 },
                 wgpu::Extent3d {
                     width: w,
-                    height: h,
+                    height: sheet_h,
                     depth_or_array_layers: 1,
                 },
             );
@@ -381,7 +406,7 @@ impl LayerData {
         Self {
             texture,
             vertex_buffer,
-            vertex_count: verts.len() as u32,
+            vertex_count,
         }
     }
 
@@ -408,6 +433,8 @@ impl LayerData {
 struct ViewData {
     layer: LayerData,
     staging_texture: Texture,
+    staging_vertex_buffer: wgpu::Buffer,
+    staging_vertex_count: u32,
     anim_vertex_buffer: Option<wgpu::Buffer>,
     anim_vertex_count: u32,
     layer_vertex_buffer: Option<wgpu::Buffer>,
@@ -428,11 +455,27 @@ impl ViewData {
         pixels: Option<&[Rgba8]>,
     ) -> Self {
         let staging_texture = Texture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let layer = LayerData::new(device, w, sheet_h, pixels, queue);
+        let layer = LayerData::new(device, w, h, sheet_h, pixels, queue);
+
+        // The staging texture maps 1:1 onto the display footprint.
+        let staging_batch = sprite2d::Batch::singleton(
+            w,
+            h,
+            Rect::origin(w as f32, h as f32),
+            Rect::origin(w as f32, h as f32),
+            ZDepth::default(),
+            Rgba::TRANSPARENT,
+            1.,
+            Repeat::default(),
+        );
+        let (staging_vertex_buffer, staging_vertex_count) =
+            sprite_vertex_buffer(device, queue, &staging_batch, "staging_vertex_buffer");
 
         Self {
             layer,
             staging_texture,
+            staging_vertex_buffer,
+            staging_vertex_count,
             anim_vertex_buffer: None,
             anim_vertex_count: 0,
             layer_vertex_buffer: None,
@@ -1410,8 +1453,16 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: true,
             });
+            // The final pass targets the sheet-sized layer texture, while
+            // shapes are display-space: under the sheet-tall ortho the
+            // display band lands in the *bottom* strip — layer 0 — with
+            // no extra transform (the projection is y-up: view y = 0 is
+            // the texture's bottom row). P37 routes writes to the active
+            // layer by translating +active_layer * fh here.
+            let final_ortho: M44 =
+                ortho_wgpu(v.width(), v.sheet_height(), Origin::TopLeft).into();
             let final_uniforms = TransformUniforms {
-                ortho: view_ortho,
+                ortho: final_ortho,
                 transform: identity,
             };
             view_uniform_buffer
@@ -1623,7 +1674,8 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                         });
 
                     pass.set_bind_group(1, &staging_bind_group, &[]);
-                    pass.draw(0..view_data.layer.vertex_count, 0..1);
+                    pass.set_vertex_buffer(0, view_data.staging_vertex_buffer.slice(..));
+                    pass.draw(0..view_data.staging_vertex_count, 0..1);
                 }
             }
 
@@ -2120,9 +2172,14 @@ impl Renderer {
                             .get_mut(&v.id)
                             .expect("views must have associated view data");
                         let texels = util::align_u8(&pixels);
+                        // `dst` is a y-up sheet rect; the upload offset is
+                        // y-down texture rows. The texture size is used (not
+                        // the resource extent) because a same-frame `Resize`
+                        // op may already have grown it.
+                        let [_, th] = view_data.layer.texture.size;
                         view_data.layer.upload_part(
                             &self.queue,
-                            [dst.x1 as u32, dst.y1 as u32],
+                            [dst.x1 as u32, th - dst.y2 as u32],
                             [src.width() as u32, src.height() as u32],
                             texels,
                         );
@@ -2278,9 +2335,12 @@ impl Renderer {
                         .get_mut(&v.id)
                         .expect("views must have associated view data");
                     let texels = &[rgba.r, rgba.g, rgba.b, rgba.a];
+                    // `y` is a display-space row; offset it into the bottom
+                    // strip of the sheet (no-op for single-layer views).
+                    let [_, th] = view_data.layer.texture.size;
                     view_data.layer.upload_part(
                         &self.queue,
-                        [*x as u32, *y as u32],
+                        [*x as u32, (th - v.fh) + *y as u32],
                         [1, 1],
                         texels,
                     );

@@ -2788,6 +2788,63 @@ impl Session {
                 self.active_view_mut().shrink();
                 self.check_selection();
             }
+            Command::LayerAdd => {
+                let v = self.active_view();
+                if (v.nlayers as u32 + 1) * v.fh > view::MAX_SHEET_DIM {
+                    self.message(
+                        format!(
+                            "Error: layer/add: sheet height would exceed {}",
+                            view::MAX_SHEET_DIM
+                        ),
+                        MessageType::Error,
+                    );
+                } else {
+                    let v = self.active_view_mut();
+                    v.extend_layer();
+                    let nlayers = v.nlayers;
+                    self.message(format!("layer/add: {} layers", nlayers), MessageType::Info);
+                }
+            }
+            Command::LayerClone(n) => {
+                let v = self.active_view();
+                let l = v.nlayers as i32;
+                if (v.nlayers as u32 + 1) * v.fh > view::MAX_SHEET_DIM {
+                    self.message(
+                        format!(
+                            "Error: layer/dup: sheet height would exceed {}",
+                            view::MAX_SHEET_DIM
+                        ),
+                        MessageType::Error,
+                    );
+                } else if n >= -1 && n < l {
+                    let v = self.active_view_mut();
+                    v.extend_clone_layer(n);
+                    let nlayers = v.nlayers;
+                    self.message(format!("layer/dup: {} layers", nlayers), MessageType::Info);
+                } else {
+                    self.message(
+                        format!("Error: dup index must be in the range {}..{}", 0, l - 1),
+                        MessageType::Error,
+                    );
+                }
+            }
+            Command::LayerRemove => {
+                let v = self.active_view();
+                if v.nlayers > 1 {
+                    let v = self.active_view_mut();
+                    v.shrink_layer();
+                    let nlayers = v.nlayers;
+                    self.message(
+                        format!("layer/remove: {} layers", nlayers),
+                        MessageType::Info,
+                    );
+                } else {
+                    self.message(
+                        "Error: layer/remove: view has only one layer".to_string(),
+                        MessageType::Error,
+                    );
+                }
+            }
             Command::Slice(None) => {
                 let v = self.active_view_mut();
                 v.slice(1);

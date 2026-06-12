@@ -69,6 +69,11 @@ pub enum Command {
     FrameNext,
     FrameResize(u32, u32),
 
+    // Layers
+    LayerAdd,
+    LayerClone(i32),
+    LayerRemove,
+
     // Palette
     PaletteAdd(Rgba8),
     PaletteClear,
@@ -178,6 +183,9 @@ impl fmt::Display for Command {
             Self::FrameAdd => write!(f, "Add a blank frame to the view"),
             Self::FrameClone(i) => write!(f, "Clone frame {} and add it to the view", i),
             Self::FrameRemove => write!(f, "Remove the last frame of the view"),
+            Self::LayerAdd => write!(f, "Add a blank layer above the view's layers"),
+            Self::LayerClone(i) => write!(f, "Clone layer {} and add it above the view's layers", i),
+            Self::LayerRemove => write!(f, "Remove the top layer of the view"),
             Self::FramePrev => write!(f, "Navigate to previous frame"),
             Self::FrameNext => write!(f, "Navigate to next frame"),
             Self::Noop => write!(f, "No-op"),
@@ -267,6 +275,9 @@ impl From<Command> for String {
             Command::FrameAdd => format!("f/add"),
             Command::FrameClone(i) => format!("f/clone {}", i),
             Command::FrameRemove => format!("f/remove"),
+            Command::LayerAdd => format!("layer/add"),
+            Command::LayerClone(i) => format!("layer/dup {}", i),
+            Command::LayerRemove => format!("layer/remove"),
             Command::Export(None, path) => format!("export {}", path),
             Command::Export(Some(s), path) => format!("export @{}x {}", s, path),
             Command::Noop => format!(""),
@@ -1001,6 +1012,18 @@ impl Default for Commands {
                 "f/remove",
                 "Remove the last frame from the active view",
                 |p| p.value(Command::FrameRemove),
+            )
+            .command("layer/add", "Add a blank layer to the active view", |p| {
+                p.value(Command::LayerAdd)
+            })
+            .command("layer/dup", "Clone a layer and add it to the view", |p| {
+                p.then(optional(integer::<i32>().label("<index>")))
+                    .map(|(_, index)| Command::LayerClone(index.unwrap_or(-1)))
+            })
+            .command(
+                "layer/remove",
+                "Remove the top layer from the active view",
+                |p| p.value(Command::LayerRemove),
             )
             .command("f/prev", "Navigate to previous frame", |p| {
                 p.value(Command::FramePrev)

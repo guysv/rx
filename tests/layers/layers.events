@@ -1,0 +1,40 @@
+00300 0001500 keyboard/input v pressed
+00300 0001500 char/received 'v'
+00312 0001560 keyboard/input v released
+00360 0001800 keyboard/input \ pressed
+00360 0001800 char/received '\'
+00372 0001860 keyboard/input \ released
+00420 0002100 keyboard/input 1 pressed
+00420 0002100 char/received '1'
+00432 0002160 keyboard/input 1 released
+00480 0002400 keyboard/input <esc> pressed
+00492 0002460 keyboard/input <esc> released
+00540 0002700 keyboard/input d pressed
+00540 0002700 char/received 'd'
+00552 0002760 keyboard/input d released
+00620 0003100 keyboard/input v pressed
+00620 0003100 char/received 'v'
+00632 0003160 keyboard/input v released
+00680 0003400 keyboard/input \ pressed
+00680 0003400 char/received '\'
+00692 0003460 keyboard/input \ released
+00740 0003700 keyboard/input 2 pressed
+00740 0003700 char/received '2'
+00752 0003760 keyboard/input 2 released
+00800 0004000 keyboard/input <esc> pressed
+00812 0004060 keyboard/input <esc> released
+00860 0004300 keyboard/input x pressed
+00860 0004300 char/received 'x'
+00872 0004360 keyboard/input x released
+00940 0004700 keyboard/input u pressed
+00940 0004700 char/received 'u'
+00952 0004760 keyboard/input u released
+01020 0005100 keyboard/input r pressed
+01020 0005100 char/received 'r'
+01032 0005160 keyboard/input r released
+01100 0005500 keyboard/input a pressed
+01100 0005500 char/received 'a'
+01112 0005560 keyboard/input a released
+01180 0005900 keyboard/input u pressed
+01180 0005900 char/received 'u'
+01192 0005960 keyboard/input u released
