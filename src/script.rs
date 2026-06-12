@@ -1154,6 +1154,22 @@ impl Ctx {
         self.session().fg
     }
 
+    /// Set the foreground color, with the picker's semantics: the old
+    /// foreground becomes the background; transparent is ignored.
+    /// color, and no builtin command does.
+    #[rune::function]
+    fn set_fg(&mut self, color: &crate::gfx::color::Rgba8) {
+        let c = *color;
+        if c.a == 0 {
+            return;
+        }
+        let s = self.session_mut();
+        if c != s.fg {
+            s.bg = s.fg;
+            s.fg = c;
+        }
+    }
+
     /// The session workspace offset `(x, y)`.
     #[rune::function]
     fn offset(&self) -> (f64, f64) {
@@ -2278,6 +2294,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::prev_mode)?;
     m.function_meta(Ctx::switch_mode)?;
     m.function_meta(Ctx::fg)?;
+    m.function_meta(Ctx::set_fg)?;
     m.function_meta(Ctx::offset)?;
     m.function_meta(Ctx::screen_size)?;
     m.function_meta(Ctx::cursor)?;
