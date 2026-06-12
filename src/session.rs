@@ -66,6 +66,10 @@ pub type SessionCoords = Point<Session, f32>;
 
 ///////////////////////////////////////////////////////////////////////////////
 
+/// Script mode names are inlined so [`Mode`] stays `Copy` (it is passed
+/// and stored by value throughout the session).
+pub type ModeString = arraystring::ArrayString<arraystring::typenum::U32>;
+
 /// An editing mode the `Session` can be in.
 /// Some of these modes are inspired by vi.
 #[derive(Eq, PartialEq, Copy, Clone, Debug, Default)]
@@ -82,6 +86,10 @@ pub enum Mode {
     Present,
     /// Activated with the `:help` command.
     Help,
+    /// A custom mode, entered by a script. Builtin input handling is
+    /// inert in script modes (except escape-to-normal); behavior comes
+    /// from the owning plugin's hooks and bindings.
+    Script(ModeString),
 }
 
 impl fmt::Display for Mode {
@@ -94,6 +102,7 @@ impl fmt::Display for Mode {
             Self::Command => "command".fmt(f),
             Self::Present => "present".fmt(f),
             Self::Help => "help".fmt(f),
+            Self::Script(name) => name.fmt(f),
         }
     }
 }
@@ -1943,8 +1952,16 @@ impl Session {
                                 self.command(Command::SelectionPaste);
                             }
                             Mode::Present | Mode::Help => {}
+                            Mode::Script(_) => {
+                                // Builtin click handling is inert in
+                                // script modes; plugins act on the
+                                // `mouse_input` hook instead.
+                            }
                         }
-                    } else {
+                    } else if !matches!(self.mode, Mode::Script(_)) {
+                        // Clicking an inactive view activates it — except
+                        // in script modes, where a click is the plugin's
+                        // to interpret (e.g. picking a rotation pivot).
                         self.activate(id);
                         self.center_selection(self.cursor);
                     }

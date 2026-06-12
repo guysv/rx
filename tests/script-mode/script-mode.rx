@@ -1,0 +1,10 @@
+-- Exercises P12: custom script modes. `:funky` enters the mode (the
+-- plugin draws a label while it's active), escape exits it via the
+-- builtin catch-all. The scenario round-trips: enter, escape, re-enter.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
