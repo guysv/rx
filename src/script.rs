@@ -1965,13 +1965,12 @@ impl Ctx {
         Some(ScriptBindGroup { bind_group })
     }
 
-    /// Build a vertex buffer for one textured quad mapping the whole of
-    /// `texture` onto `dst` (target pixels), tinted with `color` at
-    /// `opacity`. Six vertices.
-    #[rune::function]
-    fn create_sprite_vertices(
+    /// Shared body of the sprite-vertex constructors: one textured quad
+    /// mapping `src` (texture pixels) onto `dst` (target pixels).
+    fn sprite_vertices(
         &mut self,
         texture: &ScriptTexture,
+        src: &Rect,
         dst: &Rect,
         color: &crate::gfx::color::Rgba8,
         opacity: f64,
@@ -1986,7 +1985,7 @@ impl Ctx {
         let (src_w, src_h) = (texture.width, texture.height);
         let mut batch = crate::gfx::sprite2d::Batch::new(src_w, src_h);
         batch.add(
-            GfxRect::new(0.0, 0.0, src_w as f32, src_h as f32),
+            GfxRect::new(src.x1 as f32, src.y1 as f32, src.x2 as f32, src.y2 as f32),
             GfxRect::new(dst.x1 as f32, dst.y1 as f32, dst.x2 as f32, dst.y2 as f32),
             ZDepth::default(),
             (*color).into(),
@@ -2020,6 +2019,39 @@ impl Ctx {
             buffer,
             count: vertices.len() as u32,
         })
+    }
+
+    /// Build a vertex buffer for one textured quad mapping the whole of
+    /// `texture` onto `dst` (target pixels), tinted with `color` at
+    /// `opacity`. Six vertices.
+    #[rune::function]
+    fn create_sprite_vertices(
+        &mut self,
+        texture: &ScriptTexture,
+        dst: &Rect,
+        color: &crate::gfx::color::Rgba8,
+        opacity: f64,
+    ) -> Option<ScriptBuffer> {
+        let src = Rect {
+            x1: 0.0,
+            y1: 0.0,
+            x2: texture.width as f64,
+            y2: texture.height as f64,
+        };
+        self.sprite_vertices(texture, &src, dst, color, opacity)
+    }
+
+    /// Like `create_sprite_vertices`, but maps only the `src` rect of
+    /// the texture (in texture pixels) onto `dst` — white, full
+    /// a composited sheet.
+    #[rune::function]
+    fn create_sprite_vertices_src(
+        &mut self,
+        texture: &ScriptTexture,
+        src: &Rect,
+        dst: &Rect,
+    ) -> Option<ScriptBuffer> {
+        self.sprite_vertices(texture, src, dst, &crate::gfx::color::Rgba8::WHITE, 1.0)
     }
 
     /// Export a function for other plugins to call via
@@ -2282,6 +2314,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::create_transform_params_bind_group)?;
     m.function_meta(Ctx::create_texture_bind_group)?;
     m.function_meta(Ctx::create_sprite_vertices)?;
+    m.function_meta(Ctx::create_sprite_vertices_src)?;
     m.function_meta(rgb)?;
     m.function_meta(rect)?;
     m.function_meta(mat4_identity)?;
