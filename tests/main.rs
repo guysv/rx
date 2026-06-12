@@ -210,6 +210,9 @@ fn rotate_scale() {
 }
 
 #[test]
+}
+
+#[test]
 fn source() {
     test("source");
 }
