@@ -415,15 +415,20 @@ struct ViewData {
 }
 
 impl ViewData {
+    /// `h` is the *display* height (one strip): the staging texture
+    /// covers the workspace footprint. `sheet_h` is the *sheet* height
+    /// (one strip per layer): the layer texture holds all strips. The
+    /// two are equal for single-layer views.
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         w: u32,
         h: u32,
+        sheet_h: u32,
         pixels: Option<&[Rgba8]>,
     ) -> Self {
         let staging_texture = Texture::new(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let layer = LayerData::new(device, w, h, pixels, queue);
+        let layer = LayerData::new(device, w, sheet_h, pixels, queue);
 
         Self {
             layer,
@@ -2028,10 +2033,10 @@ impl Renderer {
                 Effect::ViewActivated(_) => {}
                 Effect::ViewAdded(id) => {
                     if let Some((s, pixels)) = session.views.get_snapshot_safe(id) {
-                        let (w, h) = (s.width(), s.height());
+                        let (w, h, sheet_h) = (s.width(), s.extent.fh, s.height());
                         self.view_data.insert(
                             id,
-                            ViewData::new(&self.device, &self.queue, w, h, Some(pixels)),
+                            ViewData::new(&self.device, &self.queue, w, h, sheet_h, Some(pixels)),
                         );
                     }
                 }
@@ -2327,7 +2332,9 @@ impl Renderer {
         let tw = u32::min(ew, vw);
         let th = u32::min(eh, vh);
 
-        let view_data = ViewData::new(&self.device, &self.queue, vw, vh, None);
+        // `vw`/`vh` are sheet dimensions (from `ViewOp::Resize` or a
+        // damaged extent); the staging texture stays display-sized.
+        let view_data = ViewData::new(&self.device, &self.queue, vw, view.fh, vh, None);
 
         if let Some((_, texels)) = view
             .layer

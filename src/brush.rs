@@ -229,7 +229,11 @@ impl Brush {
     /// Expand a point into all brush heads.
     pub fn expand(&self, p: ViewCoords<i32>, extent: ViewExtent) -> Vec<ViewCoords<i32>> {
         let mut pixels = vec![*p];
-        let ViewExtent { fw, fh, nframes } = extent;
+        // Brush geometry is display-space: layers don't participate
+        // (strokes are routed to the active layer's strip at emission).
+        let ViewExtent {
+            fw, fh, nframes, ..
+        } = extent;
 
         if self.is_set(BrushMode::XSym) {
             for p in pixels.clone() {
