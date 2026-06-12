@@ -97,6 +97,11 @@ fn frames() {
 }
 
 #[test]
+fn layers() {
+    test("layers");
+}
+
+#[test]
 fn ui() {
     test("ui");
 }
