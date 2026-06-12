@@ -140,6 +140,16 @@ fn cleanedge() {
 }
 
 #[test]
+fn mmpx() {
+    test("mmpx");
+}
+
+#[test]
+fn rotsprite() {
+    test("rotsprite");
+}
+
+#[test]
 fn source() {
     test("source");
 }
