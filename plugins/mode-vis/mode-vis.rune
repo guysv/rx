@@ -1,0 +1,24 @@
+// mode-vis: current mode indicator (Rune port of mode-vis.rxx).
+
+const TEXT_X = 10.0;
+const TEXT_Y = 46.0;
+
+pub fn init(rx) {
+    #{}
+}
+
+pub fn draw(state, rx) {
+    let mode = rx.mode();
+    let label = `-- ${mode.to_uppercase()} --`;
+
+    if mode == "normal" {
+        rx.draw_text(label, TEXT_X, TEXT_Y, rx::rgb(255, 255, 255));
+    } else if mode.starts_with("visual") {
+        rx.draw_text(label, TEXT_X, TEXT_Y, rx::rgb(0xff, 0x33, 0x66));
+    } else if mode == "command" {
+        // command mode is skipped
+    } else {
+        // script and other modes
+        rx.draw_text(label, TEXT_X, TEXT_Y, rx::rgb(0xff, 0x33, 0x66));
+    }
+}

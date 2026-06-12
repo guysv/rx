@@ -110,6 +110,11 @@ fn plugin_load() {
 }
 
 #[test]
+fn mode_vis() {
+    test("mode-vis");
+}
+
+#[test]
 fn source() {
     test("source");
 }
