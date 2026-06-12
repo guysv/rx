@@ -183,7 +183,9 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
         &mut execution,
         Duration::default(),
         Duration::default(),
+        &mut plugins,
     );
+    plugins.dispatch_effects(&mut session, &effects);
     renderer.init(effects, &session);
 
     let mut render_timer = FrameTimer::new();
@@ -322,8 +324,16 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
             continue;
         }
 
-        let effects =
-            update_timer.run(|avg| session.update(&mut session_events, &mut execution, delta, avg));
+        let effects = update_timer.run(|avg| {
+            session.update(
+                &mut session_events,
+                &mut execution,
+                delta,
+                avg,
+                &mut plugins,
+            )
+        });
+        plugins.dispatch_effects(&mut session, &effects);
 
         render_timer.run(|avg| {
             renderer
