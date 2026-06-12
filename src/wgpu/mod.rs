@@ -1455,15 +1455,18 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             });
             // The final pass targets the sheet-sized layer texture, while
             // shapes are display-space: under the sheet-tall ortho the
-            // display band lands in the *bottom* strip — layer 0 — with
-            // no extra transform (the projection is y-up: view y = 0 is
-            // the texture's bottom row). P37 routes writes to the active
-            // layer by translating +active_layer * fh here.
+            // display band lands in the *bottom* strip with no extra
+            // transform (the projection is y-up: view y = 0 is the
+            // texture's bottom row), so writes route to the active layer
+            // by translating up the sheet, one strip per index.
             let final_ortho: M44 =
                 ortho_wgpu(v.width(), v.sheet_height(), Origin::TopLeft).into();
+            let routed = Matrix4::from_translation(
+                Vector2::new(0., (v.active_layer as u32 * v.fh) as f32).extend(0.),
+            );
             let final_uniforms = TransformUniforms {
                 ortho: final_ortho,
-                transform: identity,
+                transform: routed.into(),
             };
             view_uniform_buffer
                 .slice(..)
@@ -1648,13 +1651,6 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                             ],
                         });
 
-                    pass.set_pipeline(&self.sprite_pipeline);
-                    pass.set_bind_group(0, &view_transform_bind_group, &[]);
-                    pass.set_bind_group(1, &view_texture_bind_group, &[]);
-                    pass.set_vertex_buffer(0, view_data.layer.vertex_buffer.slice(..));
-                    pass.draw(0..view_data.layer.vertex_count, 0..1);
-
-                    // Also render staging buffer
                     let staging_bind_group =
                         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("staging_bind_group"),
@@ -1673,9 +1669,28 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                             ],
                         });
 
+                    // Layer strips composite bottom-up (six vertices per
+                    // strip quad), with the staging overlay at the active
+                    // layer's depth: in-progress strokes preview correctly
+                    // occluded by the layers above.
+                    let count = view_data.layer.vertex_count;
+                    let split = ((view.active_layer as u32 + 1) * 6).min(count);
+
+                    pass.set_pipeline(&self.sprite_pipeline);
+                    pass.set_bind_group(0, &view_transform_bind_group, &[]);
+                    pass.set_bind_group(1, &view_texture_bind_group, &[]);
+                    pass.set_vertex_buffer(0, view_data.layer.vertex_buffer.slice(..));
+                    pass.draw(0..split, 0..1);
+
                     pass.set_bind_group(1, &staging_bind_group, &[]);
                     pass.set_vertex_buffer(0, view_data.staging_vertex_buffer.slice(..));
                     pass.draw(0..view_data.staging_vertex_count, 0..1);
+
+                    if split < count {
+                        pass.set_bind_group(1, &view_texture_bind_group, &[]);
+                        pass.set_vertex_buffer(0, view_data.layer.vertex_buffer.slice(..));
+                        pass.draw(split..count, 0..1);
+                    }
                 }
             }
 
@@ -2130,37 +2145,25 @@ impl Renderer {
                     self.resize_view(v, *w, *h)?;
                 }
                 ViewOp::Clear(color) => {
+                    // Clear the *active layer's* strip only (the whole
+                    // texture for single-layer views, as before). A pass
+                    // load-op clear can't be scissored, so the strip is
+                    // overwritten with an upload.
                     let view_data = self
                         .view_data
                         .get(&v.id)
                         .expect("views must have associated view data");
-                    let mut encoder =
-                        self.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("clear_encoder"),
-                            });
-                    {
-                        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("clear_view"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view_data.layer.texture.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: color.r as f64 / 255.0,
-                                        g: color.g as f64 / 255.0,
-                                        b: color.b as f64 / 255.0,
-                                        a: color.a as f64 / 255.0,
-                                    }),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                    }
-                    self.queue.submit(std::iter::once(encoder.finish()));
+                    let [tw, th] = view_data.layer.texture.size;
+                    let strip_y = th - (v.active_layer as u32 + 1) * v.fh;
+                    let texels: Vec<u8> = [color.r, color.g, color.b, color.a]
+                        .iter()
+                        .cycle()
+                        .take((tw * v.fh) as usize * 4)
+                        .cloned()
+                        .collect();
+                    view_data
+                        .layer
+                        .upload_part(&self.queue, [0, strip_y], [tw, v.fh], &texels);
                 }
                 ViewOp::Blit(src, dst) => {
                     // Get pixels from the view's CPU snapshot
@@ -2186,10 +2189,10 @@ impl Renderer {
                     }
                 }
                 ViewOp::Yank(src) => {
-                    // Get pixels from the view's CPU snapshot (like GL)
-                    if let Some((_, pixels)) =
-                        v.resource.layer.get_snapshot_rect(&src.map(|n| n as i32))
-                    {
+                    // `src` is a display-space rect; the snapshot read routes
+                    // to the active layer's strip (y-up sheet coords).
+                    let src = *src + Vector2::new(0, (v.active_layer as u32 * v.fh) as i32);
+                    if let Some((_, pixels)) = v.resource.layer.get_snapshot_rect(&src) {
                         let (w, h) = (src.width() as u32, src.height() as u32);
 
                         // Resize paste texture if needed
@@ -2226,10 +2229,11 @@ impl Renderer {
                     }
                 }
                 ViewOp::Flip(src, dir) => {
-                    // Get pixels from the view's CPU snapshot and flip in CPU
-                    if let Some((_, mut pixels)) =
-                        v.resource.layer.get_snapshot_rect(&src.map(|n| n as i32))
-                    {
+                    // `src` is display-space; read from the active layer's
+                    // strip, flip on the CPU, and write back through the
+                    // paste machinery (routed by the final-pass transform).
+                    let src = *src + Vector2::new(0, (v.active_layer as u32 * v.fh) as i32);
+                    if let Some((_, mut pixels)) = v.resource.layer.get_snapshot_rect(&src) {
                         let (w, h) = (src.width() as u32, src.height() as u32);
 
                         match dir {
@@ -2335,12 +2339,13 @@ impl Renderer {
                         .get_mut(&v.id)
                         .expect("views must have associated view data");
                     let texels = &[rgba.r, rgba.g, rgba.b, rgba.a];
-                    // `y` is a display-space row; offset it into the bottom
-                    // strip of the sheet (no-op for single-layer views).
+                    // `y` is a display-space row; offset it into the active
+                    // layer's strip (no-op for single-layer views).
                     let [_, th] = view_data.layer.texture.size;
+                    let strip = th - (v.active_layer as u32 + 1) * v.fh;
                     view_data.layer.upload_part(
                         &self.queue,
-                        [*x as u32, (th - v.fh) + *y as u32],
+                        [*x as u32, strip + *y as u32],
                         [1, 1],
                         texels,
                     );

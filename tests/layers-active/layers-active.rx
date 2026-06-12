@@ -1,0 +1,22 @@
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = off
+
+map         v           :mode visual
+map         u           :undo
+map         a           :layer/add
+map         n           :layer/next
+map         p           :layer/prev
+map         x           :layer/remove
+map/visual  n           :layer/next
+map/visual  \           :selection/expand
+map/visual  1           :selection/fill #ff0000
+map/visual  2           :selection/fill #0055ff
+map/visual  e           :selection/erase
+map/visual  y           :selection/yank
+map/visual  o           :selection/paste
+map/visual  ]           :selection/offset 32 32

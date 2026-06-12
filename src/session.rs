@@ -2845,6 +2845,42 @@ impl Session {
                     );
                 }
             }
+            Command::LayerNext => {
+                let v = self.active_view_mut();
+                let n = v.active_layer + 1;
+                v.activate_layer(n);
+                let (active, nlayers) = (v.active_layer, v.nlayers);
+                self.message(
+                    format!("layer {}/{}", active + 1, nlayers),
+                    MessageType::Info,
+                );
+            }
+            Command::LayerPrev => {
+                let v = self.active_view_mut();
+                let n = v.active_layer.saturating_sub(1);
+                v.activate_layer(n);
+                let (active, nlayers) = (v.active_layer, v.nlayers);
+                self.message(
+                    format!("layer {}/{}", active + 1, nlayers),
+                    MessageType::Info,
+                );
+            }
+            Command::LayerSet(n) => {
+                let v = self.active_view_mut();
+                if n >= 0 && v.activate_layer(n as usize) {
+                    let (active, nlayers) = (v.active_layer, v.nlayers);
+                    self.message(
+                        format!("layer {}/{}", active + 1, nlayers),
+                        MessageType::Info,
+                    );
+                } else {
+                    let l = self.active_view().nlayers;
+                    self.message(
+                        format!("Error: set index must be in the range {}..{}", 0, l - 1),
+                        MessageType::Error,
+                    );
+                }
+            }
             Command::Slice(None) => {
                 let v = self.active_view_mut();
                 v.slice(1);

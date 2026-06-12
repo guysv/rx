@@ -285,6 +285,19 @@ fn draw_ui(session: &Session, canvas: &mut shape2d::Batch, text: &mut TextBatch)
             TextAlign::Right,
         );
 
+        // Active layer indicator (only for layered views, so the
+        // single-layer status line is unchanged).
+        if view.nlayers > 1 {
+            text.add(
+                &format!("L{}/{}", view.active_layer + 1, view.nlayers),
+                session.width - MARGIN - 64.,
+                MARGIN + self::LINE_HEIGHT,
+                self::TEXT_LAYER,
+                Rgba8::WHITE,
+                TextAlign::Right,
+            );
+        }
+
         if session.width >= 600. {
             let cursor = session.view_coords(view.id, session.cursor);
             let hover_color = session
