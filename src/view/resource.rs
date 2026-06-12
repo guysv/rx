@@ -400,8 +400,8 @@ impl Snapshot {
             Compressed::from(pixels).expect("compressing snapshot shouldn't result in an error");
 
         debug_assert!(
-            (extent.fw * extent.fh) as usize * extent.nframes == size,
-            "the pixel buffer has the expected size"
+            (extent.width() * extent.height()) as usize == size,
+            "the pixel buffer has the expected (sheet) size"
         );
 
         Self {
@@ -419,12 +419,14 @@ impl Snapshot {
             .map(|y| (y * self.width() + p.x) as usize)
     }
 
+    /// Snapshot (sheet) width.
     pub fn width(&self) -> u32 {
-        self.extent.fw * self.extent.nframes as u32
+        self.extent.width()
     }
 
+    /// Snapshot (sheet) height.
     pub fn height(&self) -> u32 {
-        self.extent.fh
+        self.extent.height()
     }
 
     ////////////////////////////////////////////////////////////////////////////

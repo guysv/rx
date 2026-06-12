@@ -46,6 +46,12 @@ impl fmt::Display for ViewId {
 pub type ViewCoords<T> = Point<ViewExtent, T>;
 
 /// View extent information.
+///
+/// The extent describes the view *sheet*: frames are horizontal strips
+/// of the sheet, layers are vertical strips. The sheet is `fw * nframes`
+/// wide and `fh * nlayers` tall. The view's *display* footprint in the
+/// workspace is the sheet width by a single strip height (`fh`) — see
+/// `View::height` vs `View::sheet_height`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewExtent {
     /// Frame width.
@@ -54,38 +60,63 @@ pub struct ViewExtent {
     pub fh: u32,
     /// Number of frames.
     pub nframes: usize,
+    /// Number of layers.
+    pub nlayers: usize,
 }
 
 impl ViewExtent {
+    /// A single-layer extent.
     pub fn new(fw: u32, fh: u32, nframes: usize) -> Self {
-        ViewExtent { fw, fh, nframes }
+        Self::layered(fw, fh, nframes, 1)
     }
 
-    /// Extent total width.
+    /// An extent with the given number of layers.
+    pub fn layered(fw: u32, fh: u32, nframes: usize, nlayers: usize) -> Self {
+        debug_assert!(nlayers >= 1, "a view always has at least one layer");
+        ViewExtent {
+            fw,
+            fh,
+            nframes,
+            nlayers,
+        }
+    }
+
+    /// Extent total (sheet) width.
     pub fn width(&self) -> u32 {
         self.fw * self.nframes as u32
     }
 
-    /// Extent total height.
+    /// Extent total (sheet) height: one strip per layer.
     pub fn height(&self) -> u32 {
-        self.fh
+        self.fh * self.nlayers as u32
     }
 
-    /// Rect containing the whole extent.
+    /// Rect containing the whole extent (the sheet).
     pub fn rect(&self) -> Rect<u32> {
         Rect::origin(self.width(), self.height())
     }
 
-    /// Rect containing a single frame.
+    /// Rect containing a single frame, within the bottom layer strip.
     pub fn frame(&self, n: usize) -> Rect<u32> {
         let n = n as u32;
         Rect::new(self.fw * n, 0, self.fw * n + self.fw, self.fh)
+    }
+
+    /// Rect containing a single layer strip (all frames), in sheet space.
+    pub fn layer(&self, n: usize) -> Rect<u32> {
+        let n = n as u32;
+        Rect::new(0, self.fh * n, self.width(), self.fh * (n + 1))
     }
 
     /// Compute the frame index, given a point.
     /// Warning: can underflow.
     pub fn to_frame(self, p: ViewCoords<u32>) -> usize {
         (p.x / self.fw) as usize
+    }
+
+    /// Compute the layer index, given a sheet-space point.
+    pub fn to_layer(self, p: ViewCoords<u32>) -> usize {
+        (p.y / self.fh) as usize
     }
 }
 
@@ -128,6 +159,9 @@ pub struct View<R> {
     pub fw: u32,
     /// Frame height.
     pub fh: u32,
+    /// Number of layers. Layers are vertical strips of the view sheet,
+    /// as frames are horizontal strips.
+    pub nlayers: usize,
     /// View offset relative to the session workspace.
     pub offset: Vector2<f32>,
     /// Identifier.
@@ -210,6 +244,7 @@ impl<R> View<R> {
             id,
             fw,
             fh,
+            nlayers: 1,
             offset: Vector2::zero(),
             zoom: 1.,
             ops: Vec::new(),
@@ -228,12 +263,19 @@ impl<R> View<R> {
         self.fw * self.animation.len() as u32
     }
 
-    /// View height.
+    /// View *display* height: the workspace footprint, one strip tall.
+    /// The underlying sheet may be taller — see `sheet_height`.
     pub fn height(&self) -> u32 {
         self.fh
     }
 
-    /// View width and height.
+    /// View *sheet* height: the pixel storage height, one strip per
+    /// layer. Equal to `height()` only for single-layer views.
+    pub fn sheet_height(&self) -> u32 {
+        self.fh * self.nlayers as u32
+    }
+
+    /// View display width and height.
     pub fn size(&self) -> (u32, u32) {
         (self.width(), self.height())
     }
@@ -289,7 +331,12 @@ impl<R> View<R> {
 
     /// Resize view frames to the given size.
     pub fn resize_frames(&mut self, fw: u32, fh: u32) {
-        self.reset(ViewExtent::new(fw, fh, self.animation.len()));
+        self.reset(ViewExtent::layered(
+            fw,
+            fh,
+            self.animation.len(),
+            self.nlayers,
+        ));
         self.resized();
     }
 
@@ -320,7 +367,7 @@ impl<R> View<R> {
     pub fn slice(&mut self, nframes: usize) -> bool {
         if nframes > 0 && self.width() % nframes as u32 == 0 {
             let fw = self.width() / nframes as u32;
-            self.reset(ViewExtent::new(fw, self.fh, nframes));
+            self.reset(ViewExtent::layered(fw, self.fh, nframes, self.nlayers));
             // FIXME: This is very inefficient. Since the actual frame contents
             // haven't changed, we don't need to create a full snapshot. We just
             // have to record how many frames are in this snapshot.
@@ -430,7 +477,7 @@ impl<R> View<R> {
 
     /// Return the view extent.
     pub fn extent(&self) -> ViewExtent {
-        ViewExtent::new(self.fw, self.fh, self.animation.len())
+        ViewExtent::layered(self.fw, self.fh, self.animation.len(), self.nlayers)
     }
 
     /// Return the view bounds, as an origin-anchored rectangle.
@@ -452,7 +499,8 @@ impl<R> View<R> {
         if self.state == ViewState::Okay {
             self.state = ViewState::Dirty(Some(self.extent()));
         }
-        self.ops.push(ViewOp::Resize(self.width(), self.fh));
+        self.ops
+            .push(ViewOp::Resize(self.width(), self.sheet_height()));
     }
 
     /// Check whether the given snapshot has been saved to disk.
@@ -470,6 +518,7 @@ impl<R> View<R> {
     fn reset(&mut self, extent: ViewExtent) {
         self.fw = extent.fw;
         self.fh = extent.fh;
+        self.nlayers = extent.nlayers;
 
         let mut frames = Vec::new();
         let origin = Rect::origin(self.fw as f32, self.fh as f32);
@@ -818,6 +867,70 @@ impl<R> ViewManager<R> {
         self.next_id = ViewId(id + 1);
 
         ViewId(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extent_single_layer() {
+        let e = ViewExtent::new(16, 12, 3);
+
+        assert_eq!(e.nlayers, 1);
+        assert_eq!(e, ViewExtent::layered(16, 12, 3, 1));
+        assert_eq!(e.width(), 48);
+        assert_eq!(e.height(), 12);
+        assert_eq!(e.rect(), Rect::origin(48, 12));
+        assert_eq!(e.layer(0), Rect::new(0, 0, 48, 12));
+        assert_eq!(e.frame(1), Rect::new(16, 0, 32, 12));
+    }
+
+    #[test]
+    fn test_extent_layered() {
+        let e = ViewExtent::layered(16, 12, 3, 4);
+
+        // Width is unaffected by layers; height is one strip per layer.
+        assert_eq!(e.width(), 48);
+        assert_eq!(e.height(), 48);
+        assert_eq!(e.rect(), Rect::origin(48, 48));
+
+        // Layer strips span all frames, stacked bottom-up.
+        assert_eq!(e.layer(0), Rect::new(0, 0, 48, 12));
+        assert_eq!(e.layer(3), Rect::new(0, 36, 48, 48));
+
+        // `frame` stays within the bottom strip.
+        assert_eq!(e.frame(2), Rect::new(32, 0, 48, 12));
+
+        // Sheet-space points map back to layer indices.
+        assert_eq!(e.to_layer(ViewCoords::new(0, 0)), 0);
+        assert_eq!(e.to_layer(ViewCoords::new(47, 11)), 0);
+        assert_eq!(e.to_layer(ViewCoords::new(0, 12)), 1);
+        assert_eq!(e.to_layer(ViewCoords::new(47, 47)), 3);
+    }
+
+    #[test]
+    fn test_view_sheet_height() {
+        let mut v: View<()> = View::new(ViewId(1), FileStatus::NoFile, 16, 12, 2, ());
+
+        assert_eq!(v.nlayers, 1);
+        assert_eq!(v.height(), 12);
+        assert_eq!(v.sheet_height(), 12);
+        assert_eq!(v.extent(), ViewExtent::new(16, 12, 2));
+
+        // A layered extent round-trips through `reset` (the undo path).
+        v.restore_extent(0, ViewExtent::layered(16, 12, 2, 3));
+        assert_eq!(v.nlayers, 3);
+        assert_eq!(v.height(), 12, "display height is one strip");
+        assert_eq!(v.sheet_height(), 36);
+        assert_eq!(v.extent(), ViewExtent::layered(16, 12, 2, 3));
+
+        // Frame ops preserve the layer count.
+        v.extend();
+        assert_eq!(v.extent(), ViewExtent::layered(16, 12, 3, 3));
+        assert!(v.slice(1));
+        assert_eq!(v.extent(), ViewExtent::layered(48, 12, 1, 3));
     }
 }
 
