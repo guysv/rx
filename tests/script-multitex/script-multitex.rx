@@ -1,0 +1,15 @@
+-- Exercises P24: multi-texture pipelines. The fixture plugin draws a
+-- two-texture blend (a checker and a gradient, both CPU-uploaded)
+-- through a `textures = 2` render pipeline every frame, plus a quad of
+-- a compute output texture. :mt/sum runs the two-input compute pass
+-- (sum of checker and gradient), turning that quad from transparent to
+-- the summed colors — digest-distinct before and after.
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

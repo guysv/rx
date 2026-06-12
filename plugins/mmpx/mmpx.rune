@@ -9,7 +9,7 @@
 pub fn init(rx) {
     let wgsl = rx.read_file("mmpx.wgsl").unwrap();
     let shader = rx.create_shader(wgsl).unwrap();
-    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_mmpx", true).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_mmpx", 1).unwrap();
     rx.export("render_pass", render_pass);
     #{ pipeline }
 }

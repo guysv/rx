@@ -1,0 +1,89 @@
+// Fixture plugin: P24 multi-texture pipelines. Every frame, the
+// `render` stage draws a blend of two CPU-uploaded textures (red/blue
+// checker × horizontal green gradient) through a two-texture pipeline,
+// and a quad of the compute output texture — transparent until
+// :mt/sum runs the two-input compute sum.
+pub fn init(rx) {
+    let wgsl = rx.read_file("multitex.wgsl").unwrap();
+    let shader = rx.create_shader(wgsl).unwrap();
+    let blend = rx.create_render_pipeline(shader, "vs_main", "fs_blend", 2).unwrap();
+    let sum = rx.create_compute_pipeline(shader, "cs_sum", 2).unwrap();
+
+    let checker = rx.create_texture(8, 8).unwrap();
+    let data = Bytes::new();
+    for i in 0..64 {
+        if (i % 8 + i / 8) % 2 == 0 {
+            data.extend(b"\xff\x00\x00\xff");
+        } else {
+            data.extend(b"\x00\x00\xff\xff");
+        }
+    }
+    checker.upload(data);
+
+    let gradient = rx.create_texture(8, 8).unwrap();
+    let data = Bytes::new();
+    for y in 0..8 {
+        for x in 0..8 {
+            data.push(0);
+            data.push(x * 36);
+            data.push(0);
+            data.push(255);
+        }
+    }
+    gradient.upload(data);
+
+    let out = rx.create_texture(8, 8).unwrap();
+    let cbg = rx.create_compute_bind_group([checker, gradient], out).unwrap();
+
+    rx.register_command("mt/sum", [], "Run the two-input compute sum", sum_cmd);
+    #{ blend, sum, checker, gradient, out, cbg, pending: false }
+}
+
+pub fn sum_cmd(state, rx, args) {
+    state.pending = true;
+}
+
+pub fn shade(state, rx, encoder) {
+    if !state.pending {
+        return;
+    }
+    state.pending = false;
+    let pass = encoder.begin_compute_pass("sum").unwrap();
+    pass.set_pipeline(state.sum).unwrap();
+    pass.set_bind_group(0, state.cbg).unwrap();
+    pass.dispatch(1, 1, 1).unwrap();
+    pass.end();
+}
+
+fn quad_verts(rx, tex, x, y) {
+    rx.create_sprite_vertices(
+        tex,
+        rx::rect(x, y, x + 64.0, y + 64.0),
+        rx::rgb(255, 255, 255),
+        1.0,
+    ).unwrap()
+}
+
+pub fn render(state, rx, pass) {
+    let (w, h) = rx.screen_size();
+    let tbg = rx.create_transform_bind_group(w, h, rx::mat4_identity()).unwrap();
+
+    // Two-texture blend quad.
+    let v = quad_verts(rx, state.checker, 60.0, 500.0);
+    pass.set_pipeline(state.blend).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, rx.create_texture_bind_group(state.checker).unwrap()).unwrap();
+    pass.set_bind_group(2, rx.create_texture_bind_group(state.gradient).unwrap()).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+
+    // Compute output quad (the blend of a texture with itself is the
+    // texture; reuses the same two-texture pipeline).
+    let v = quad_verts(rx, state.out, 160.0, 500.0);
+    pass.set_pipeline(state.blend).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, rx.create_texture_bind_group(state.out).unwrap()).unwrap();
+    pass.set_bind_group(2, rx.create_texture_bind_group(state.out).unwrap()).unwrap();
+    pass.set_vertex_buffer(0, v).unwrap();
+    pass.draw(v.count(), 1).unwrap();
+}

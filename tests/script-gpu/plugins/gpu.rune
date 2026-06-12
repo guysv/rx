@@ -7,8 +7,8 @@
 pub fn init(rx) {
     let wgsl = rx.read_file("gpu.wgsl").unwrap();
     let shader = rx.create_shader(wgsl).unwrap();
-    let render = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
-    let compute = rx.create_compute_pipeline(shader, "cs_invert").unwrap();
+    let render = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
+    let compute = rx.create_compute_pipeline(shader, "cs_invert", 1).unwrap();
 
     // 8x8 source: fill() red, then upload() a red/green checker over it
     // (the upload must win over the fill).
@@ -26,7 +26,7 @@ pub fn init(rx) {
 
     let out = rx.create_texture(8, 8).unwrap(); // compute output
     let mid = rx.create_texture(8, 8).unwrap(); // render-pass intermediate
-    let cbg = rx.create_compute_bind_group(src, out).unwrap();
+    let cbg = rx.create_compute_bind_group([src], out).unwrap();
 
     rx.register_command("gpu/stamp", [], "Stamp the inverted checker into the view", stamp);
     rx.register_command("gpu/preview", [], "Toggle the staging preview", preview);
