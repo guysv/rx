@@ -100,12 +100,130 @@ impl Ctx {
         self.session().mode.to_string()
     }
 
+    /// Previous mode, if any.
+    #[rune::function]
+    fn prev_mode(&self) -> Option<String> {
+        self.session().prev_mode.as_ref().map(|m| m.to_string())
+    }
+
     /// Post a message to the message line.
     #[rune::function]
     fn message(&mut self, msg: &str) {
         self.session_mut()
             .message(msg.to_string(), crate::session::MessageType::Echo);
     }
+
+    /// Id of the active view.
+    #[rune::function]
+    fn active_view_id(&self) -> i64 {
+        u16::from(self.session().views.active_id) as i64
+    }
+
+    /// Snapshots of all views, in view order.
+    #[rune::function]
+    fn views(&self) -> Vec<ViewInfo> {
+        self.session()
+            .views
+            .iter()
+            .map(|v| ViewInfo {
+                id: u16::from(v.id) as i64,
+                width: v.width() as i64,
+                height: v.height() as i64,
+                offset_x: v.offset.x as f64,
+                offset_y: v.offset.y as f64,
+                zoom: v.zoom as f64,
+            })
+            .collect()
+    }
+
+    /// A setting's value: bool, integer, float, string or a tuple,
+    /// depending on the setting. Unit if the setting doesn't exist.
+    #[rune::function]
+    fn setting(&self, name: &str) -> Value {
+        use crate::cmd::Value as V;
+
+        let unit = || rune::to_value(()).expect("unit converts");
+        match self.session().settings.get(name) {
+            None => unit(),
+            Some(V::Bool(b)) => rune::to_value(*b).unwrap_or_else(|_| unit()),
+            Some(V::U32(n)) => rune::to_value(*n as i64).unwrap_or_else(|_| unit()),
+            Some(V::U32Tuple(a, b)) => {
+                rune::to_value((*a as i64, *b as i64)).unwrap_or_else(|_| unit())
+            }
+            Some(V::F32Tuple(a, b)) => {
+                rune::to_value((*a as f64, *b as f64)).unwrap_or_else(|_| unit())
+            }
+            Some(V::F64(f)) => rune::to_value(*f).unwrap_or_else(|_| unit()),
+            Some(V::Str(s)) | Some(V::Ident(s)) => {
+                rune::to_value(s.clone()).unwrap_or_else(|_| unit())
+            }
+            Some(V::Rgba8(c)) => rune::to_value(c.to_string()).unwrap_or_else(|_| unit()),
+        }
+    }
+
+    /// Set a setting. The value must match the setting's current type.
+    /// Returns whether the set was applied.
+    #[rune::function]
+    fn set_setting(&mut self, name: &str, value: Value) -> bool {
+        use crate::cmd::Value as V;
+
+        let converted = match self.session().settings.get(name) {
+            None => None,
+            Some(V::Bool(_)) => rune::from_value::<bool>(value).ok().map(V::Bool),
+            Some(V::U32(_)) => rune::from_value::<i64>(value).ok().map(|n| V::U32(n as u32)),
+            Some(V::F64(_)) => rune::from_value::<f64>(value).ok().map(V::F64),
+            Some(V::Str(_)) => rune::from_value::<String>(value).ok().map(V::Str),
+            Some(V::Ident(_)) => rune::from_value::<String>(value).ok().map(V::Ident),
+            Some(V::U32Tuple(..)) | Some(V::F32Tuple(..)) | Some(V::Rgba8(_)) => None,
+        };
+        match converted {
+            Some(v) => self.session_mut().settings.set(name, v).is_ok(),
+            None => false,
+        }
+    }
+
+    /// The current selection bounds as `(x1, y1, x2, y2)`, if any.
+    #[rune::function]
+    fn selection(&self) -> Option<(i64, i64, i64, i64)> {
+        self.session().selection.map(|s| {
+            let r = s.bounds();
+            (r.x1 as i64, r.y1 as i64, r.x2 as i64, r.y2 as i64)
+        })
+    }
+
+    /// Replace the selection with the given bounds.
+    #[rune::function]
+    fn set_selection(&mut self, x1: i64, y1: i64, x2: i64, y2: i64) {
+        self.session_mut().selection = Some(crate::session::Selection::new(
+            x1 as i32, y1 as i32, x2 as i32, y2 as i32,
+        ));
+    }
+
+    /// Clear the selection.
+    #[rune::function]
+    fn clear_selection(&mut self) {
+        self.session_mut().selection = None;
+    }
+}
+
+/// An immutable snapshot of a view, handed to scripts. Mutation goes
+/// through session methods by id — live references never cross the
+/// boundary (docs/rune-plan.md).
+#[derive(rune::Any, Clone)]
+#[rune(item = ::rx)]
+pub struct ViewInfo {
+    #[rune(get)]
+    pub id: i64,
+    #[rune(get)]
+    pub width: i64,
+    #[rune(get)]
+    pub height: i64,
+    #[rune(get)]
+    pub offset_x: f64,
+    #[rune(get)]
+    pub offset_y: f64,
+    #[rune(get)]
+    pub zoom: f64,
 }
 
 /// The native `rx` module installed into every plugin's context.
@@ -113,7 +231,16 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     let mut m = rune::Module::with_crate("rx")?;
     m.ty::<Ctx>()?;
     m.function_meta(Ctx::mode)?;
+    m.function_meta(Ctx::prev_mode)?;
     m.function_meta(Ctx::message)?;
+    m.function_meta(Ctx::active_view_id)?;
+    m.function_meta(Ctx::views)?;
+    m.function_meta(Ctx::setting)?;
+    m.function_meta(Ctx::set_setting)?;
+    m.function_meta(Ctx::selection)?;
+    m.function_meta(Ctx::set_selection)?;
+    m.function_meta(Ctx::clear_selection)?;
+    m.ty::<ViewInfo>()?;
     Ok(m)
 }
 
@@ -587,6 +714,110 @@ mod test {
             Err(ScriptError::Vm(_)) => {}
             other => panic!("expected Vm error, got: {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn session_view_api() {
+        use crate::view::FileStatus;
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 128, 96);
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let views = rx.views();
+                    let v = views[0];
+                    (rx.active_view_id(), views.len(), v.width, v.height)
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (id, count, w, h): (i64, i64, i64, i64) = rune::from_value(v).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(id, 1);
+        assert_eq!((w, h), (128, 96));
+    }
+
+    #[test]
+    fn settings_get_set() {
+        let mut session = test_session();
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let before = rx.setting("debug");
+                    let ok = rx.set_setting("debug", true);
+                    let bad_type = rx.set_setting("debug", 3.5);
+                    let missing = rx.set_setting("no/such/setting", 1);
+                    (before, ok, bad_type, missing, rx.setting("debug"))
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (before, ok, bad_type, missing, after): (bool, bool, bool, bool, bool) =
+            rune::from_value(v).unwrap();
+        assert!(!before);
+        assert!(ok);
+        assert!(!bad_type, "type-mismatched set must be rejected");
+        assert!(!missing, "unknown setting must be rejected");
+        assert!(after, "the set must be visible");
+        assert!(session.settings["debug"].is_set());
+    }
+
+    #[test]
+    fn selection_round_trip() {
+        let mut session = test_session();
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let empty = rx.selection();
+                    rx.set_selection(1, 2, 11, 22);
+                    let some = rx.selection();
+                    (empty, some)
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (empty, some): (Option<(i64, i64, i64, i64)>, Option<(i64, i64, i64, i64)>) =
+            rune::from_value(v).unwrap();
+        assert_eq!(empty, None);
+        assert_eq!(some, Some((1, 2, 11, 22)));
+        assert!(session.selection.is_some());
+    }
+
+    #[test]
+    fn prev_mode_tracks_switches() {
+        use crate::session::Mode;
+
+        let mut session = test_session();
+        session.switch_mode(Mode::Help);
+
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str("t", "pub fn probe(rx) { (rx.mode(), rx.prev_mode()) }")
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (mode, prev): (String, Option<String>) = rune::from_value(v).unwrap();
+        assert_eq!(mode, "help");
+        assert_eq!(prev.as_deref(), Some("normal"));
     }
 
     fn write_plugin(dir: &Path, name: &str, body: &str) {

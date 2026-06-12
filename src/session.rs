@@ -1168,7 +1168,7 @@ impl Session {
     }
 
     /// Switch the session mode.
-    fn switch_mode(&mut self, mode: Mode) {
+    pub(crate) fn switch_mode(&mut self, mode: Mode) {
         let (old, new) = (self.mode, mode);
         if old == new {
             return;
