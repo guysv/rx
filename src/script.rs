@@ -510,6 +510,18 @@ pub struct ScriptEncoder {
 }
 
 impl ScriptEncoder {
+    /// End every pass begun so far: wgpu allows one open pass per
+    /// encoder, so beginning a new one auto-ends its predecessors
+    /// (sequential-pass semantics; a kept handle errors cleanly).
+    fn end_open_passes(&self) {
+        for pass in self.passes.lock().expect("pass list lock").drain(..) {
+            pass.lock().expect("pass lock").take();
+        }
+        for pass in self.cpasses.lock().expect("compute pass list lock").drain(..) {
+            pass.lock().expect("pass lock").take();
+        }
+    }
+
     fn begin(
         &self,
         label: &str,
@@ -521,6 +533,7 @@ impl ScriptEncoder {
             "clear" => wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             other => return Err(format!("unknown load op `{}`", other)),
         };
+        self.end_open_passes();
         let mut guard = self.enc.lock().expect("encoder lock");
         let Some(encoder) = guard.as_mut() else {
             return Err("the encoder is no longer valid".to_string());
@@ -575,6 +588,7 @@ impl ScriptEncoder {
     /// Begin a compute pass.
     #[rune::function]
     fn begin_compute_pass(&self, label: &str) -> Result<ScriptComputePass, String> {
+        self.end_open_passes();
         let mut guard = self.enc.lock().expect("encoder lock");
         let Some(encoder) = guard.as_mut() else {
             return Err("the encoder is no longer valid".to_string());
@@ -1229,7 +1243,9 @@ impl Ctx {
         } else if let Ok(f) = rune::from_value::<f64>(value.clone()) {
             V::F64(f)
         } else if let Ok(s) = rune::from_value::<String>(value) {
-            V::Str(s)
+            // Ident rather than Str: `:set name = value` parses bare
+            // words as idents, and the discriminants must match.
+            V::Ident(s)
         } else {
             self.session_mut().message(
                 format!("Error: unsupported value for setting `{}`", name),
@@ -1412,7 +1428,7 @@ impl Ctx {
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
         if let Some(e) = gfx.pop_error() {
-            let msg = first_line_str(&e.to_string());
+            let msg = flatten_error(&e.to_string());
             self.error(format!("shader: {}", msg));
             return None;
         }
@@ -1505,7 +1521,7 @@ impl Ctx {
                 cache: None,
             });
         if let Some(e) = gfx.pop_error() {
-            let msg = first_line_str(&e.to_string());
+            let msg = flatten_error(&e.to_string());
             self.error(format!("pipeline: {}", msg));
             return None;
         }
@@ -1620,7 +1636,7 @@ impl Ctx {
                 cache: None,
             });
         if let Some(e) = gfx.pop_error() {
-            let msg = first_line_str(&e.to_string());
+            let msg = flatten_error(&e.to_string());
             self.error(format!("compute pipeline: {}", msg));
             return None;
         }
@@ -1655,7 +1671,7 @@ impl Ctx {
             ],
         });
         if let Some(e) = gfx.pop_error() {
-            let msg = first_line_str(&e.to_string());
+            let msg = flatten_error(&e.to_string());
             self.error(format!("compute bind group: {}", msg));
             return None;
         }
@@ -2551,9 +2567,24 @@ impl PluginHost {
             }
             let gpu_error = gfx.as_ref().and_then(|g| g.pop_error());
 
+            // A validation error poisons the wgpu command encoder: any
+            // further recording (including the host's own passes) would
+            // be fatal. Swap in a fresh one; the plugin's work this
+            // frame is lost, the frame itself is not.
+            if gpu_error.is_some() {
+                if let Some(g) = gfx.as_ref() {
+                    *shared.lock().expect("encoder lock") =
+                        Some(g.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("render_encoder"),
+                            },
+                        ));
+                }
+            }
+
             let error = match (result, gpu_error) {
                 (Err(e), _) => Some(first_line(&e)),
-                (Ok(_), Some(e)) => Some(first_line_str(&e.to_string())),
+                (Ok(_), Some(e)) => Some(flatten_error(&e.to_string())),
                 (Ok(_), None) => None,
             };
             if let Some(e) = error {
@@ -2666,6 +2697,19 @@ fn first_line_str(s: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// Flatten a (possibly multi-line, with-cause) error display into one
+/// message-bar line.
+fn flatten_error(s: &str) -> String {
+    let mut out = String::new();
+    for l in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        out.push_str(l.trim_end_matches(':'));
+    }
+    out
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -4203,6 +4247,64 @@ mod test {
         assert!(
             session.message.to_string().contains("disabled"),
             "calling a gone export must fail loudly: {}",
+            session.message
+        );
+    }
+
+    #[test]
+    fn rotsprite_chain_smoke() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        std::os::unix::fs::symlink(plugins.join("rotsprite"), dir.path().join("rotsprite")).unwrap();
+        std::os::unix::fs::symlink(plugins.join("mmpx"), dir.path().join("mmpx")).unwrap();
+        write_plugin(
+            dir.path(),
+            "driver",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn shade(state, rx, encoder) {
+                let src = rx.create_texture(8, 8).unwrap();
+                src.fill(rx::rgb(255, 0, 0));
+                let target = rx.create_texture(64, 64).unwrap();
+                rx.call_plugin("rotsprite", "render_pass",
+                    [encoder, rx::mat4_identity(), target, src,
+                     rx::rect(0.0, 0.0, 64.0, 64.0), 64, 64]).unwrap();
+            }
+            "#,
+        );
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 3, "all plugins must load: {}", session.message);
+
+        // Default (EPX) chain.
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            3,
+            "EPX chain must not error: {}",
+            session.message
+        );
+
+        // Delegated (mmpx) chain.
+        session
+            .settings
+            .set("rotsprite/algo", crate::cmd::Value::Ident("mmpx".into()))
+            .unwrap();
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            3,
+            "mmpx chain must not error: {}",
             session.message
         );
     }

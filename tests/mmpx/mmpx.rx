@@ -1,0 +1,13 @@
+-- Exercises P19: the mmpx interface plugin, driven by a test
+-- plugin. A red block is filled into the selection, then :stamp
+-- upscales it 2x through mmpx::render_pass next to it. Undo
+-- removes the stamp (round-trip).
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = on
+
+v/fill #ffffff

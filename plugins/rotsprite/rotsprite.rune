@@ -1,0 +1,82 @@
+// rotsprite: rotsprite-style rotation/scale render pass (Rune port of
+// rotsprite-gl.rxx; the WGSL is unchanged from master).
+//
+// An interface plugin: exports `render_pass` with the meta-plugin
+// calling convention. The source is upscaled 8x through three x2
+// passes (EPX by default; the `rotsprite/algo` setting names
+// another plugin's render_pass to delegate to, e.g. `mmpx`), then the
+// final pass samples the upscale with the caller's transform.
+
+pub fn init(rx) {
+    let wgsl = rx.read_file("rotsprite.wgsl").unwrap();
+    rx.declare_setting("rotsprite/algo", "");
+    let shader = rx.create_shader(wgsl).unwrap();
+    let epx_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_epx", true).unwrap();
+    let final_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_final", true).unwrap();
+    rx.export("render_pass", render_pass);
+    #{ epx_pipeline, final_pipeline }
+}
+
+fn run_x2(state, rx, encoder, source, target, dst_w, dst_h, algo) {
+    let dst = rx::rect(0.0, 0.0, dst_w as f64, dst_h as f64);
+    if algo != "" {
+        rx.call_plugin(
+            algo,
+            "render_pass",
+            [encoder, rx::mat4_identity(), target, source, dst, dst_w, dst_h],
+        )
+        .unwrap();
+        return;
+    }
+
+    let tbg = rx.create_transform_bind_group(dst_w, dst_h, rx::mat4_identity()).unwrap();
+    let sbg = rx.create_texture_bind_group(source).unwrap();
+    let verts = rx.create_sprite_vertices(source, dst, rx::rgb(255, 255, 255), 1.0).unwrap();
+    let pass = encoder.begin_render_pass("rotsprite-epx", target, "clear").unwrap();
+    pass.set_pipeline(state.epx_pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, verts).unwrap();
+    pass.draw(verts.count(), 1).unwrap();
+}
+
+pub fn render_pass(state, rx, args) {
+    let encoder = args[0];
+    let transform = args[1];
+    let target = args[2];
+    let source = args[3];
+    let dst = args[4];
+    let ortho_w = args[5];
+    let ortho_h = args[6];
+
+    let src_w = source.width();
+    let src_h = source.height();
+    if src_w <= 0 || src_h <= 0 {
+        return;
+    }
+    let algo = rx.setting("rotsprite/algo");
+    let algo = if algo is String { algo } else { "" };
+
+    let tex2 = rx.create_texture(src_w * 2, src_h * 2).unwrap();
+    let tex4 = rx.create_texture(src_w * 4, src_h * 4).unwrap();
+    let tex8 = rx.create_texture(src_w * 8, src_h * 8).unwrap();
+
+    run_x2(state, rx, encoder, source, tex2, src_w * 2, src_h * 2, algo);
+    run_x2(state, rx, encoder, tex2, tex4, src_w * 4, src_h * 4, algo);
+    run_x2(state, rx, encoder, tex4, tex8, src_w * 8, src_h * 8, algo);
+
+    let tbg = rx.create_transform_bind_group(ortho_w, ortho_h, transform).unwrap();
+    let sbg = rx.create_texture_bind_group(tex8).unwrap();
+    let verts = rx.create_sprite_vertices(tex8, dst, rx::rgb(255, 255, 255), 1.0).unwrap();
+
+    let pass = if target is i64 {
+        encoder.begin_view_pass("rotsprite-final", target, "load").unwrap()
+    } else {
+        encoder.begin_render_pass("rotsprite-final", target, "load").unwrap()
+    };
+    pass.set_pipeline(state.final_pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, verts).unwrap();
+    pass.draw(verts.count(), 1).unwrap();
+}
