@@ -816,6 +816,7 @@ impl Session {
         exec: &mut Execution,
         delta: time::Duration,
         avg_time: time::Duration,
+        plugins: &mut crate::script::PluginHost,
     ) -> Vec<Effect> {
         self.settings_changed.clear();
         self.avg_time = avg_time;
@@ -856,7 +857,7 @@ impl Session {
                     .drain(..end.unwrap_or(recording.len()))
                     .collect::<Vec<TimedEvent>>()
                     .into_iter()
-                    .for_each(|t| self.handle_event(t.event, exec));
+                    .for_each(|t| self.handle_event(t.event, exec, plugins));
 
                 let verify_ended = mode == DigestMode::Verify && result.is_done() && end.is_none();
                 let replay_ended = mode != DigestMode::Verify && end.is_none();
@@ -918,9 +919,12 @@ impl Session {
             }
 
             for event in events.drain(..) {
-                self.handle_event(event, exec);
+                self.handle_event(event, exec, plugins);
             }
         }
+
+        // Script hooks: mode-switch edges, then per-update.
+        plugins.dispatch_update(self);
 
         if let Tool::Brush = self.tool {
             let brush = &self.brush;
@@ -1765,7 +1769,12 @@ impl Session {
     // Event handlers
     ///////////////////////////////////////////////////////////////////////////
 
-    pub fn handle_event(&mut self, event: Event, exec: &mut Execution) {
+    pub fn handle_event(
+        &mut self,
+        event: Event,
+        exec: &mut Execution,
+        plugins: &mut crate::script::PluginHost,
+    ) {
         if let Execution::Recording {
             ref mut events,
             start,
@@ -1779,9 +1788,22 @@ impl Session {
             ));
         }
 
+        // Script hooks observe input before builtin handling.
         match event {
             Event::MouseInput(btn, st) => {
                 if self.settings["input/mouse"].is_set() {
+                    let button = match btn {
+                        platform::MouseButton::Left => "left",
+                        platform::MouseButton::Right => "right",
+                        platform::MouseButton::Middle => "middle",
+                        _ => "other",
+                    };
+                    let input = match st {
+                        InputState::Pressed => "pressed",
+                        InputState::Released => "released",
+                        InputState::Repeated => "repeated",
+                    };
+                    plugins.dispatch_mouse_input(self, button, input);
                     self.handle_mouse_input(btn, st);
                 }
             }
@@ -1792,6 +1814,7 @@ impl Session {
             }
             Event::CursorMoved(position) => {
                 if self.settings["input/mouse"].is_set() {
+                    plugins.dispatch_cursor_moved(self, position.x, position.y);
                     let coords = self.window_to_session_coords(position);
                     self.handle_cursor_moved(coords);
                 }

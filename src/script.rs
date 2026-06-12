@@ -375,6 +375,9 @@ pub struct Plugin {
     pub name: String,
     script: CompiledScript,
     state: Value,
+    /// Cleared when a hook errors at runtime; the plugin stops receiving
+    /// hooks but its siblings are unaffected.
+    enabled: bool,
 }
 
 /// Owns all plugins. Lives outside [`Session`] so hooks can borrow the
@@ -384,6 +387,40 @@ pub struct PluginHost {
     plugins: Vec<Plugin>,
     dir: Option<std::path::PathBuf>,
     watcher: Option<ReloadWatcher>,
+    /// Last mode reported to `switch_mode` hooks (edge detection).
+    last_mode: Option<String>,
+}
+
+/// Loop over enabled plugins defining `$hook` and call it; disable a
+/// plugin whose hook errors. A macro rather than a generic fn: the
+/// argument tuple borrows a per-call local `Ctx`, which a closure-based
+/// helper can't express without aliasing the host.
+macro_rules! dispatch {
+    ($host:expr, $session:expr, $hook:expr, |$state:ident, $ctx:ident| $args:tt) => {
+        for i in 0..$host.plugins.len() {
+            {
+                let plugin = &$host.plugins[i];
+                if !plugin.enabled || !plugin.script.has_fn($hook) {
+                    continue;
+                }
+            }
+            let $state = $host.plugins[i].state.clone();
+            let mut ctx = Ctx::new($session);
+            let $ctx = &mut ctx;
+            let result = $host.plugins[i].script.call($hook, $args);
+            drop(ctx);
+            if let Err(e) = result {
+                let plugin = &mut $host.plugins[i];
+                plugin.enabled = false;
+                log::error!("plugin `{}` {}: {}", plugin.name, $hook, e);
+                let name = plugin.name.clone();
+                $session.message(
+                    format!("Plugin `{}` disabled: {}", name, first_line(&e)),
+                    crate::session::MessageType::Error,
+                );
+            }
+        }
+    };
 }
 
 impl PluginHost {
@@ -399,6 +436,7 @@ impl PluginHost {
             plugins: Vec::new(),
             dir,
             watcher,
+            last_mode: None,
         })
     }
 
@@ -476,6 +514,7 @@ impl PluginHost {
                 name,
                 script,
                 state,
+                enabled: true,
             });
         }
     }
@@ -513,7 +552,64 @@ impl PluginHost {
         self.load(session);
         session.message("Plugins reloaded", crate::session::MessageType::Execution);
     }
+
+    ////////////////////////////////////////////////////////////////////////
+    // Hook dispatch
+    //
+    // Each dispatch loops over enabled plugins that define the hook and
+    // calls it with `(state, rx, ...)`. A runtime error disables the
+    // offending plugin and reports it; siblings are unaffected.
+
+    /// Cursor moved (window logical coordinates). Runs before builtin
+    /// event handling.
+    pub fn dispatch_cursor_moved(&mut self, session: &mut Session, x: f64, y: f64) {
+        dispatch!(self, session, "cursor_moved", |state, ctx| (
+            state, ctx, x, y
+        ));
+    }
+
+    /// Mouse button input. Runs before builtin event handling.
+    pub fn dispatch_mouse_input(&mut self, session: &mut Session, button: &str, input: &str) {
+        dispatch!(self, session, "mouse_input", |state, ctx| (
+            state,
+            ctx,
+            button.to_string(),
+            input.to_string()
+        ));
+    }
+
+    /// End-of-update dispatch: fires `switch_mode` on mode edges, then
+    /// `update`.
+    pub fn dispatch_update(&mut self, session: &mut Session) {
+        let mode = session.mode.to_string();
+        if self.last_mode.as_deref() != Some(mode.as_str()) {
+            self.last_mode = Some(mode);
+            dispatch!(self, session, "switch_mode", |state, ctx| (state, ctx));
+        }
+        dispatch!(self, session, "update", |state, ctx| (state, ctx));
+    }
+
+    /// View lifecycle hooks, driven from the session's effects.
+    pub fn dispatch_effects(&mut self, session: &mut Session, effects: &[crate::session::Effect]) {
+        use crate::session::Effect;
+
+        for effect in effects {
+            let (hook, id) = match effect {
+                Effect::ViewAdded(id) => ("view_added", *id),
+                Effect::ViewRemoved(id) => ("view_removed", *id),
+                _ => continue,
+            };
+            let id = u16::from(id) as i64;
+            match hook {
+                "view_added" => {
+                    dispatch!(self, session, "view_added", |state, ctx| (state, ctx, id))
+                }
+                _ => dispatch!(self, session, "view_removed", |state, ctx| (state, ctx, id)),
+            }
+        }
+    }
 }
+
 
 /// First line of an error display, for the one-line message bar.
 fn first_line(e: &ScriptError) -> String {
@@ -897,6 +993,160 @@ mod test {
         assert_eq!(host.plugins().count(), 1);
         // The reload banner is posted last; v2's init ran before it.
         assert_eq!(session.message.to_string(), "Plugins reloaded");
+    }
+
+    fn host_with(dir: &Path, name: &str, body: &str) -> (PluginHost, Session) {
+        write_plugin(dir, name, body);
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 1, "fixture plugin must load");
+        (host, session)
+    }
+
+    #[test]
+    fn input_hooks_fire_before_builtins_via_update() {
+        use crate::event::Event;
+        use crate::execution::Execution;
+        use crate::platform;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn cursor_moved(state, rx, x, y) {
+                rx.message(`cursor ${x} ${y}`);
+            }
+            pub fn mouse_input(state, rx, button, input) {
+                rx.message(`mouse ${button} ${input}`);
+            }
+            "#,
+        );
+        // The builtin handlers need an active view to exist.
+        let mut session = session.with_blank(crate::view::FileStatus::NoFile, 32, 32);
+
+        let mut exec = Execution::normal().unwrap();
+        let mut events = vec![Event::CursorMoved(platform::LogicalPosition::new(5.0, 6.0))];
+        session.update(
+            &mut events,
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.message.to_string(), "cursor 5.0 6.0");
+
+        let mut events = vec![Event::MouseInput(
+            platform::MouseButton::Left,
+            platform::InputState::Pressed,
+        )];
+        session.update(
+            &mut events,
+            &mut exec,
+            Duration::default(),
+            Duration::default(),
+            &mut host,
+        );
+        assert_eq!(session.message.to_string(), "mouse left pressed");
+    }
+
+    #[test]
+    fn switch_mode_hook_fires_on_edges_only() {
+        use crate::session::Mode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) { #{ switches: 0 } }
+            pub fn switch_mode(state, rx) {
+                state.switches += 1;
+                rx.message(`switched to ${rx.mode()} (#${state.switches})`);
+            }
+            "#,
+        );
+
+        // First dispatch observes the initial mode as an edge.
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), "switched to normal (#1)");
+
+        // Same mode: no edge, no hook.
+        session.message("sentinel", crate::session::MessageType::Info);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), "sentinel");
+
+        session.switch_mode(Mode::Help);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), "switched to help (#2)");
+    }
+
+    #[test]
+    fn view_lifecycle_hooks() {
+        use crate::session::Effect;
+        use crate::view::FileStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut host, session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn view_added(state, rx, id) { rx.message(`added ${id}`); }
+            pub fn view_removed(state, rx, id) { rx.message(`removed ${id}`); }
+            "#,
+        );
+        let mut session = session.with_blank(FileStatus::NoFile, 32, 32);
+        let id = session.views.active_id;
+
+        host.dispatch_effects(&mut session, &[Effect::ViewAdded(id)]);
+        assert_eq!(session.message.to_string(), "added 1");
+        host.dispatch_effects(&mut session, &[Effect::ViewRemoved(id)]);
+        assert_eq!(session.message.to_string(), "removed 1");
+    }
+
+    #[test]
+    fn erroring_hook_disables_only_that_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin(
+            dir.path(),
+            "bad",
+            r#"
+            pub fn init(rx) { #{} }
+            pub fn update(state, rx) { None.unwrap() }
+            "#,
+        );
+        write_plugin(
+            dir.path(),
+            "good",
+            r#"
+            pub fn init(rx) { #{ ticks: 0 } }
+            pub fn update(state, rx) {
+                state.ticks += 1;
+                rx.message(`tick ${state.ticks}`);
+            }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(host.plugins().count(), 2);
+
+        host.dispatch_update(&mut session);
+        // `bad` errored and was disabled; `good` still ran (it runs after
+        // `bad` alphabetically, so its message is the last one).
+        assert_eq!(session.message.to_string(), "tick 1");
+
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), "tick 2");
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "bad plugin must be disabled"
+        );
     }
 
     #[test]
