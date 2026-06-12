@@ -1,0 +1,9 @@
+00000 0000010 cursor/moved 639 359
+00020 0000100 keyboard/input z pressed
+00025 0000150 keyboard/input z released
+00040 0000200 keyboard/input f pressed
+00045 0000250 keyboard/input f released
+00060 0000300 mouse/input pressed
+00065 0000350 mouse/input released
+00100 0000500 keyboard/input u pressed
+00105 0000550 keyboard/input u released
