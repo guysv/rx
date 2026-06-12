@@ -1329,10 +1329,13 @@ impl Ctx {
     }
 
     /// The current selection bounds as `(x1, y1, x2, y2)`, if any.
+    /// Normalized (`x1 <= x2`, `y1 <= y2`) regardless of the drag
+    /// direction that created the selection, like the built-in
+    /// selection commands see it.
     #[rune::function]
     fn selection(&self) -> Option<(i64, i64, i64, i64)> {
         self.session().selection.map(|s| {
-            let r = s.bounds();
+            let r = s.abs().bounds();
             (r.x1 as i64, r.y1 as i64, r.x2 as i64, r.y2 as i64)
         })
     }
@@ -4159,6 +4162,85 @@ mod test {
         assert_eq!(px(64, 59), [0xff, 0xff, 0xff, 0xff], "above block must be outlined");
         assert_eq!(px(64, 62), [0, 0, 0, 0], "block interior must not be painted");
         assert_eq!(px(20, 20), [0, 0, 0, 0], "far field must stay clear");
+    }
+
+    #[test]
+    fn selection_outline_reversed_selection() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 128, 128);
+        let mut host = PluginHost::new(Some(dir)).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert!(
+            host.plugins().any(|p| p.name == "selection-outline" && p.enabled),
+            "plugin must load: {}",
+            session.message
+        );
+
+        // A block sitting off-center in the selection, which was dragged
+        // from bottom-right to top-left: the rect is reversed on both
+        // axes, like an interactive right-to-left drag produces. The
+        // outline must land on the block, not on its mirror image.
+        use crate::gfx::Rgba8;
+        let mut pixels = vec![Rgba8::TRANSPARENT; 128 * 128];
+        for y in 60..65 {
+            for x in 50..60 {
+                pixels[y * 128 + x] = Rgba8::new(0xff, 0xff, 0xff, 0xff);
+            }
+        }
+        session
+            .views
+            .active_mut()
+            .unwrap()
+            .resource
+            .record_view_painted(pixels);
+
+        session.selection = Some(crate::session::Selection::new(90, 90, 41, 41));
+        host.dispatch_command(&mut session, "selection/outline", "");
+        assert!(
+            !session.message.to_string().starts_with("Error")
+                && !session.message.to_string().contains("disabled"),
+            "command must succeed: {}",
+            session.message
+        );
+
+        let id = u16::from(session.views.active_id);
+        let mut targets = ViewTargets::new();
+        let target = ScriptTexture::create(&gfx, 128, 128);
+        let staging = ScriptTexture::create(&gfx, 128, 128);
+        let srgb_view = |t: &ScriptTexture| {
+            t.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
+                format: Some(SCRIPT_TEXTURE_FORMAT),
+                ..Default::default()
+            })
+        };
+        targets.insert(
+            id,
+            ViewTarget {
+                layer: srgb_view(&target),
+                staging: srgb_view(&staging),
+                width: 128,
+                height: 128,
+            },
+        );
+
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, targets);
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+
+        let out = target.pixels(&gfx.device);
+        let px = |x: usize, y: usize| {
+            let i = (y * 128 + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        assert_eq!(px(49, 62), [0xff, 0xff, 0xff, 0xff], "left of block must be outlined");
+        assert_eq!(px(60, 62), [0xff, 0xff, 0xff, 0xff], "right of block must be outlined");
+        assert_eq!(px(55, 62), [0, 0, 0, 0], "block interior must not be painted");
+        assert_eq!(px(75, 62), [0, 0, 0, 0], "the outline must not be mirrored");
     }
 
     #[test]

@@ -22,25 +22,10 @@
 00220 0002200 char/received 'e'
 00230 0002300 keyboard/input <return> pressed
 00235 0002350 keyboard/input <return> released
-00260 0002600 char/received ':'
-00270 0002700 char/received 's'
-00280 0002800 char/received 'e'
-00290 0002900 char/received 'l'
-00300 0003000 char/received 'e'
-00310 0003100 char/received 'c'
-00320 0003200 char/received 't'
-00330 0003300 char/received 'i'
-00340 0003400 char/received 'o'
-00350 0003500 char/received 'n'
-00360 0003600 char/received '/'
-00370 0003700 char/received 'e'
-00380 0003800 char/received 'x'
-00390 0003900 char/received 'p'
-00400 0004000 char/received 'a'
-00410 0004100 char/received 'n'
-00420 0004200 char/received 'd'
-00430 0004300 keyboard/input <return> pressed
-00435 0004350 keyboard/input <return> released
+00260 0002600 cursor/moved 680 400
+00280 0002800 mouse/input pressed
+00300 0003000 cursor/moved 600 320
+00320 0003200 mouse/input released
 00460 0004600 char/received ':'
 00470 0004700 char/received 's'
 00480 0004800 char/received 'e'
