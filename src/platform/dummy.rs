@@ -3,7 +3,7 @@ use crate::platform::{GraphicsContext, LogicalSize, WindowEvent, WindowHint};
 use std::io;
 
 pub struct Events {
-    handle: (),
+    _handle: (),
 }
 
 impl Events {
@@ -19,13 +19,11 @@ impl Events {
 }
 
 pub struct Window {
-    _private: (),
+    size: LogicalSize,
 }
 
 impl Window {
-    pub fn request_redraw(&self) {
-        unreachable!()
-    }
+    pub fn request_redraw(&self) {}
 
     pub fn handle(&self) -> &Self {
         self
@@ -35,16 +33,14 @@ impl Window {
         unreachable!()
     }
 
-    pub fn set_cursor_visible(&mut self, _visible: bool) {
-        unreachable!()
-    }
+    pub fn set_cursor_visible(&mut self, _visible: bool) {}
 
     pub fn scale_factor(&self) -> f64 {
-        unreachable!()
+        1.0
     }
 
     pub fn size(&self) -> LogicalSize {
-        unreachable!()
+        self.size
     }
 
     pub fn is_focused(&self) -> bool {
@@ -64,10 +60,15 @@ impl Window {
 
 pub fn init(
     _title: &str,
-    _w: u32,
-    _h: u32,
+    w: u32,
+    h: u32,
     _hints: &[WindowHint],
     _context: GraphicsContext,
 ) -> io::Result<(Window, Events)> {
-    panic!("`dummy` platform initialized");
+    Ok((
+        Window {
+            size: LogicalSize::new(w as f64, h as f64),
+        },
+        Events { _handle: () },
+    ))
 }
