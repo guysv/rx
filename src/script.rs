@@ -69,13 +69,16 @@ impl From<VmError> for ScriptError {
 pub struct Gfx {
     pub device: std::sync::Arc<wgpu::Device>,
     pub queue: std::sync::Arc<wgpu::Queue>,
-    /// Canonical layouts and sampler for script pipelines & bind groups.
+    /// Canonical layouts and sampler for script pipelines & bind
+    /// groups. The texture layout and sampler are Arc'd so the shade
+    /// encoder can hold them for `view_bind_group` (wgpu 23 resources
+    /// don't implement `Clone` themselves).
     transform_bgl: wgpu::BindGroupLayout,
-    texture_bgl: wgpu::BindGroupLayout,
+    texture_bgl: std::sync::Arc<wgpu::BindGroupLayout>,
     /// Compute layouts per input count (index `n - 1`): inputs at
     /// bindings `0..n`, the storage output last at binding `n`.
     compute_bgls: [wgpu::BindGroupLayout; Self::MAX_COMPUTE_INPUTS],
-    sampler: wgpu::Sampler,
+    sampler: std::sync::Arc<wgpu::Sampler>,
 }
 
 impl Gfx {
@@ -189,9 +192,9 @@ impl Gfx {
             device,
             queue,
             transform_bgl,
-            texture_bgl,
+            texture_bgl: std::sync::Arc::new(texture_bgl),
             compute_bgls,
-            sampler,
+            sampler: std::sync::Arc::new(sampler),
         }
     }
 
@@ -557,6 +560,15 @@ pub struct ViewTarget {
 /// the renderer for the `shade` stage.
 pub type ViewTargets = std::collections::HashMap<u16, ViewTarget>;
 
+/// The handles `view_bind_group` needs, cloned from [`Gfx`] when the
+/// encoder is built (wgpu resources are Arc-backed).
+#[derive(Clone)]
+struct EncoderGfx {
+    device: std::sync::Arc<wgpu::Device>,
+    texture_bgl: std::sync::Arc<wgpu::BindGroupLayout>,
+    sampler: std::sync::Arc<wgpu::Sampler>,
+}
+
 /// The command encoder handed to `shade` hooks. The host owns the
 /// underlying encoder and takes it back when dispatch ends; passes a
 /// hook leaves open are force-ended after the call, so a stored
@@ -569,6 +581,7 @@ pub struct ScriptEncoder {
     passes: PassList,
     cpasses: ComputePassList,
     view_targets: std::sync::Arc<ViewTargets>,
+    gfx: Option<EncoderGfx>,
 }
 
 impl ScriptEncoder {
@@ -661,6 +674,38 @@ impl ScriptEncoder {
             return Err(format!("no such view: {}", view_id));
         };
         self.begin(label, &target.staging, load)
+    }
+
+    /// Build a texture bind group over a view's *layer* texture: the
+    /// live GPU state, unrecorded paints included — unlike
+    /// `view_pixels`, which reads the recorded snapshot. Built fresh
+    /// from this frame's targets, so a view resize (which recreates
+    /// the layer texture) is picked up the next frame automatically.
+    /// Binding a view as input to a pass that also targets it is a
+    /// GPU validation error and disables the plugin.
+    #[rune::function]
+    fn view_bind_group(&self, view_id: i64) -> Result<ScriptBindGroup, String> {
+        let Some(target) = self.view_targets.get(&(view_id as u16)) else {
+            return Err(format!("no such view: {}", view_id));
+        };
+        let Some(gfx) = &self.gfx else {
+            return Err("the GPU is not available in this context".to_string());
+        };
+        let bind_group = gfx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("script_view_bind_group"),
+            layout: &gfx.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&target.layer),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gfx.sampler),
+                },
+            ],
+        });
+        Ok(ScriptBindGroup { bind_group })
     }
 
     /// Begin a compute pass.
@@ -2413,6 +2458,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(ScriptEncoder::begin_render_pass)?;
     m.function_meta(ScriptEncoder::begin_view_pass)?;
     m.function_meta(ScriptEncoder::begin_staging_pass)?;
+    m.function_meta(ScriptEncoder::view_bind_group)?;
     m.function_meta(ScriptEncoder::begin_compute_pass)?;
     m.ty::<ScriptPass>()?;
     m.function_meta(ScriptPass::set_pipeline)?;
@@ -2934,6 +2980,11 @@ impl PluginHost {
             gfx,
             ..
         } = self;
+        let encoder_gfx = gfx.as_ref().map(|g| EncoderGfx {
+            device: g.device.clone(),
+            texture_bgl: g.texture_bgl.clone(),
+            sampler: g.sampler.clone(),
+        });
 
         for i in 0..plugins.len() {
             {
@@ -2951,6 +3002,7 @@ impl PluginHost {
                 passes: passes.clone(),
                 cpasses: cpasses.clone(),
                 view_targets: view_targets.clone(),
+                gfx: encoder_gfx.clone(),
             };
 
             if let Some(g) = gfx.as_ref() {
@@ -4636,6 +4688,148 @@ mod test {
                     assert_eq!(at(x, y), &[0, 0, 0, 0], "({}, {}) must be empty", x, y);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn view_bind_group_samples_live_layer() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.wgsl"), TEST_WGSL).unwrap();
+        // Each shade paints the view's layer (red on the first frame,
+        // green after) and then samples that layer into `out` through
+        // `view_bind_group` — in the same frame, with no snapshot or
+        // upload in between. The readback proves liveness.
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                let wgsl = rx.read_file("test.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
+                let brush = rx.create_texture(1, 1).unwrap();
+                let out = rx.create_texture(4, 4).unwrap();
+                // Ortho normalizes, so 4x4 transforms and a (0,0,4,4)
+                // quad cover the full target whatever its pixel size.
+                let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
+                let verts = rx.create_sprite_vertices(
+                    brush,
+                    rx::rect(0.0, 0.0, 4.0, 4.0),
+                    rx::rgb(255, 255, 255),
+                    1.0,
+                ).unwrap();
+                #{ pipeline, brush, out, tbg, verts, frame: 0 }
+            }
+            pub fn shade(state, rx, encoder) {
+                state.frame = state.frame + 1;
+                let color = if state.frame == 1 { rx::rgb(255, 0, 0) } else { rx::rgb(0, 255, 0) };
+                state.brush.fill(color);
+                let id = rx.active_view_id();
+
+                let bbg = rx.create_texture_bind_group(state.brush).unwrap();
+                let pass = encoder.begin_view_pass("paint", id, "clear").unwrap();
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_bind_group(1, bbg).unwrap();
+                pass.set_vertex_buffer(0, state.verts).unwrap();
+                pass.draw(state.verts.count(), 1).unwrap();
+                pass.end();
+
+                let vbg = encoder.view_bind_group(id).unwrap();
+                let pass = encoder.begin_render_pass("sample", state.out, "clear").unwrap();
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.tbg).unwrap();
+                pass.set_bind_group(1, vbg).unwrap();
+                pass.set_vertex_buffer(0, state.verts).unwrap();
+                pass.draw(state.verts.count(), 1).unwrap();
+                pass.end();
+            }
+            pub fn out(state) { state.out }
+            "#,
+        );
+
+        let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 4, 4);
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().count(),
+            1,
+            "fixture plugin must load: {}",
+            session.message
+        );
+
+        let id = u16::from(session.views.active_id);
+        let srgb_view = |t: &ScriptTexture| {
+            t.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
+                format: Some(SCRIPT_TEXTURE_FORMAT),
+                ..Default::default()
+            })
+        };
+        let out_pixels = |host: &PluginHost| {
+            let plugin = host.plugins().next().unwrap();
+            let out = plugin.script.call("out", (plugin.state.clone(),)).unwrap();
+            let out = out.borrow_ref::<ScriptTexture>().unwrap();
+            out.pixels(&gfx.device)
+        };
+
+        // Frame 1: a 4x4 layer. The paint must come back out through
+        // the bind group within the frame.
+        let layer = ScriptTexture::create(&gfx, 4, 4);
+        let staging = ScriptTexture::create(&gfx, 4, 4);
+        let mut targets = ViewTargets::new();
+        targets.insert(
+            id,
+            ViewTarget {
+                layer: srgb_view(&layer),
+                staging: srgb_view(&staging),
+                width: 4,
+                height: 4,
+            },
+        );
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, targets);
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive the shade dispatch: {}",
+            session.message
+        );
+        for px in out_pixels(&host).chunks(4) {
+            assert_eq!(px, &[0xff, 0x00, 0x00, 0xff], "frame 1 must sample the live paint");
+        }
+
+        // Frame 2: the view was "resized" — a fresh, larger layer
+        // texture in fresh targets. The bind group is built per call,
+        // so it must track the new texture, not the old one.
+        let layer2 = ScriptTexture::create(&gfx, 8, 8);
+        let staging2 = ScriptTexture::create(&gfx, 8, 8);
+        let mut targets = ViewTargets::new();
+        targets.insert(
+            id,
+            ViewTarget {
+                layer: srgb_view(&layer2),
+                staging: srgb_view(&staging2),
+                width: 8,
+                height: 8,
+            },
+        );
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, targets);
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive the resized dispatch: {}",
+            session.message
+        );
+        for px in out_pixels(&host).chunks(4) {
+            assert_eq!(px, &[0x00, 0xff, 0x00, 0xff], "frame 2 must sample the new layer");
         }
     }
 
