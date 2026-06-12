@@ -9,7 +9,7 @@
 pub fn init(rx) {
     let wgsl = rx.read_file("screen.wgsl").unwrap();
     let shader = rx.create_shader(wgsl).unwrap();
-    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+    let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
 
     let tex = rx.create_texture(8, 8).unwrap();
     let data = Bytes::new();

@@ -11,8 +11,8 @@ pub fn init(rx) {
     let wgsl = rx.read_file("rotsprite.wgsl").unwrap();
     rx.declare_setting("rotsprite/algo", "");
     let shader = rx.create_shader(wgsl).unwrap();
-    let epx_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_epx", true).unwrap();
-    let final_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_final", true).unwrap();
+    let epx_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_epx", 1).unwrap();
+    let final_pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_final", 1).unwrap();
     rx.export("render_pass", render_pass);
     #{ epx_pipeline, final_pipeline }
 }

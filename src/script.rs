@@ -72,12 +72,21 @@ pub struct Gfx {
     /// Canonical layouts and sampler for script pipelines & bind groups.
     transform_bgl: wgpu::BindGroupLayout,
     texture_bgl: wgpu::BindGroupLayout,
-    /// Compute layout: binding 0 input texture, binding 1 storage output.
-    compute_bgl: wgpu::BindGroupLayout,
+    /// Compute layouts per input count (index `n - 1`): inputs at
+    /// bindings `0..n`, the storage output last at binding `n`.
+    compute_bgls: [wgpu::BindGroupLayout; Self::MAX_COMPUTE_INPUTS],
     sampler: wgpu::Sampler,
 }
 
 impl Gfx {
+    /// Texture groups a render pipeline may declare. Group 0 is the
+    /// transform and wgpu's default bind-group limit is 4, so at most
+    /// 3 texture groups fit (the plan's "0–4" predates the limit).
+    const MAX_TEXTURE_GROUPS: i64 = 3;
+    /// Compute inputs share group 0 with the output, so the cap is
+    /// symmetry, not a device limit.
+    const MAX_COMPUTE_INPUTS: usize = 4;
+
     fn new(device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Self {
         let transform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("script_transform_bgl"),
@@ -113,11 +122,14 @@ impl Gfx {
                 },
             ],
         });
-        let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("script_compute_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
+        // One compute layout per input count: inputs at bindings 0..n,
+        // the storage output last. n=1 is the original layout, so
+        // existing WGSL is unaffected.
+        let compute_bgls = std::array::from_fn(|i| {
+            let n = i + 1;
+            let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..n as u32)
+                .map(|binding| wgpu::BindGroupLayoutEntry {
+                    binding,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -125,18 +137,22 @@ impl Gfx {
                         multisampled: false,
                     },
                     count: None,
+                })
+                .collect();
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: n as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
+                count: None,
+            });
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("script_compute_bgl"),
+                entries: &entries,
+            })
         });
         // Clamp-to-edge: what pixel-art filters sampling outside the
         // source (cleanedge & co) want.
@@ -154,7 +170,7 @@ impl Gfx {
             queue,
             transform_bgl,
             texture_bgl,
-            compute_bgl,
+            compute_bgls,
             sampler,
         }
     }
@@ -1520,26 +1536,35 @@ impl Ctx {
     }
 
     /// Create a render pipeline from a shader and its entry points.
-    /// Bind group 0 is the transform uniforms; if `textured`, group 1
-    /// is a texture + sampler. Vertices use the sprite layout
-    /// (position, uv, color, opacity). Targets are rgba8 textures with
-    /// alpha blending.
+    /// Bind group 0 is the transform uniforms; groups `1..=textures`
+    /// (0–3) are each a texture + sampler, bound individually with
+    /// `set_bind_group(i, ...)` and `create_texture_bind_group`.
+    /// Vertices use the sprite layout (position, uv, color, opacity).
+    /// Targets are rgba8 textures with alpha blending.
     #[rune::function]
     fn create_render_pipeline(
         &mut self,
         shader: &ScriptShader,
         vs: &str,
         fs: &str,
-        textured: bool,
+        textures: i64,
     ) -> Option<ScriptPipeline> {
         let Some(gfx) = self.gfx() else {
             self.error("the GPU is not available in this context");
             return None;
         };
+        if !(0..=Gfx::MAX_TEXTURE_GROUPS).contains(&textures) {
+            self.error(format!(
+                "invalid texture group count {} (0..={})",
+                textures,
+                Gfx::MAX_TEXTURE_GROUPS
+            ));
+            return None;
+        }
         gfx.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let mut layouts: Vec<&wgpu::BindGroupLayout> = vec![&gfx.transform_bgl];
-        if textured {
+        for _ in 0..textures {
             layouts.push(&gfx.texture_bgl);
         }
         let layout = gfx
@@ -1689,24 +1714,34 @@ impl Ctx {
     }
 
     /// Create a compute pipeline from a shader and its entry point.
-    /// Bind group 0 is the compute IO layout: binding 0 an input
-    /// texture, binding 1 a write-only rgba8 storage texture.
+    /// Bind group 0 is the compute IO layout for `inputs` (1–4) input
+    /// textures: inputs at bindings `0..n`, a write-only rgba8 storage
+    /// texture last at binding `n`.
     #[rune::function]
     fn create_compute_pipeline(
         &mut self,
         shader: &ScriptShader,
         entry: &str,
+        inputs: i64,
     ) -> Option<ScriptComputePipeline> {
         let Some(gfx) = self.gfx() else {
             self.error("the GPU is not available in this context");
             return None;
         };
+        if !(1..=Gfx::MAX_COMPUTE_INPUTS as i64).contains(&inputs) {
+            self.error(format!(
+                "invalid compute input count {} (1..={})",
+                inputs,
+                Gfx::MAX_COMPUTE_INPUTS
+            ));
+            return None;
+        }
         gfx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = gfx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("script_compute_pipeline_layout"),
-                bind_group_layouts: &[&gfx.compute_bgl],
+                bind_group_layouts: &[&gfx.compute_bgls[inputs as usize - 1]],
                 push_constant_ranges: &[],
             });
         let pipeline = gfx
@@ -1727,32 +1762,55 @@ impl Ctx {
         Some(ScriptComputePipeline { pipeline })
     }
 
-    /// Create the compute IO bind group: `input` is read (raw, no sRGB
-    /// decode), `output` is written as storage.
+    /// Create the compute IO bind group: `inputs` is a list of 1–4
+    /// textures read at bindings `0..n` (raw, no sRGB decode), `output`
+    /// is written as storage at binding `n`. Must match the pipeline's
+    /// declared input count.
     #[rune::function]
     fn create_compute_bind_group(
         &mut self,
-        input: &ScriptTexture,
+        inputs: Vec<Value>,
         output: &ScriptTexture,
     ) -> Option<ScriptBindGroup> {
         let Some(gfx) = self.gfx() else {
             self.error("the GPU is not available in this context");
             return None;
         };
+        if inputs.is_empty() || inputs.len() > Gfx::MAX_COMPUTE_INPUTS {
+            self.error(format!(
+                "invalid compute input count {} (1..={})",
+                inputs.len(),
+                Gfx::MAX_COMPUTE_INPUTS
+            ));
+            return None;
+        }
+        let mut views = Vec::with_capacity(inputs.len());
+        for v in &inputs {
+            match v.borrow_ref::<ScriptTexture>() {
+                Ok(t) => views.push(t),
+                Err(_) => {
+                    self.error("compute inputs must be textures");
+                    return None;
+                }
+            }
+        }
+        let mut entries: Vec<wgpu::BindGroupEntry> = views
+            .iter()
+            .enumerate()
+            .map(|(i, t)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::TextureView(&t.raw_view),
+            })
+            .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: views.len() as u32,
+            resource: wgpu::BindingResource::TextureView(&output.raw_view),
+        });
         gfx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let bind_group = gfx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("script_compute_bind_group"),
-            layout: &gfx.compute_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&input.raw_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&output.raw_view),
-                },
-            ],
+            layout: &gfx.compute_bgls[views.len() - 1],
+            entries: &entries,
         });
         if let Some(e) = gfx.pop_error() {
             let msg = flatten_error(&e.to_string());
@@ -4102,7 +4160,7 @@ mod test {
             pub fn init(rx) {
                 let wgsl = rx.read_file("test.wgsl").unwrap();
                 let shader = rx.create_shader(wgsl).unwrap();
-                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
                 let source = rx.create_texture(4, 4).unwrap();
                 source.fill(rx::rgb(0, 0, 255));
                 let target = rx.create_texture(4, 4).unwrap();
@@ -4160,6 +4218,91 @@ mod test {
     }
 
     #[test]
+    fn multi_input_compute_sums() {
+        let Some(gfx) = test_gfx() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sum.wgsl"),
+            r#"
+            @group(0) @binding(0) var cs_a: texture_2d<f32>;
+            @group(0) @binding(1) var cs_b: texture_2d<f32>;
+            @group(0) @binding(2) var cs_out: texture_storage_2d<rgba8unorm, write>;
+
+            @compute @workgroup_size(4, 4)
+            fn cs_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let dims = textureDimensions(cs_a);
+                if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+                let a = textureLoad(cs_a, vec2<i32>(gid.xy), 0);
+                let b = textureLoad(cs_b, vec2<i32>(gid.xy), 0);
+                textureStore(cs_out, vec2<i32>(gid.xy), min(a + b, vec4<f32>(1.0)));
+            }
+            "#,
+        )
+        .unwrap();
+        write_plugin(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                let wgsl = rx.read_file("sum.wgsl").unwrap();
+                let shader = rx.create_shader(wgsl).unwrap();
+                // Count mismatches are rejected loudly.
+                if rx.create_compute_pipeline(shader, "cs_sum", 0).is_some() { panic!("0 accepted"); }
+                if rx.create_compute_pipeline(shader, "cs_sum", 5).is_some() { panic!("5 accepted"); }
+                let pipeline = rx.create_compute_pipeline(shader, "cs_sum", 2).unwrap();
+                let a = rx.create_texture(4, 4).unwrap();
+                a.fill(rx::rgb(64, 0, 32));
+                let b = rx.create_texture(4, 4).unwrap();
+                b.fill(rx::rgb(16, 8, 250));
+                let out = rx.create_texture(4, 4).unwrap();
+                if rx.create_compute_bind_group([], out).is_some() { panic!("[] accepted"); }
+                let bg = rx.create_compute_bind_group([a, b], out).unwrap();
+                #{ pipeline, bg, out }
+            }
+            pub fn shade(state, rx, encoder) {
+                let pass = encoder.begin_compute_pass("sum").unwrap();
+                pass.set_pipeline(state.pipeline).unwrap();
+                pass.set_bind_group(0, state.bg).unwrap();
+                pass.dispatch(1, 1, 1).unwrap();
+            }
+            pub fn out(state) { state.out }
+            "#,
+        );
+
+        let mut session = test_session();
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().count(),
+            1,
+            "fixture plugin must load: {}",
+            session.message
+        );
+
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "plugin must survive: {}",
+            session.message
+        );
+
+        let plugin = host.plugins().next().unwrap();
+        let out = plugin.script.call("out", (plugin.state.clone(),)).unwrap();
+        let out = out.borrow_ref::<ScriptTexture>().unwrap();
+        for px in out.pixels(&gfx.device).chunks(4) {
+            // 64+16, 0+8, 32+250 clamped, ff+ff clamped.
+            assert_eq!(px, &[80, 8, 0xff, 0xff]);
+        }
+    }
+
+    #[test]
     fn render_stage_draws_to_screen() {
         let Some(gfx) = test_gfx() else {
             eprintln!("skipping: no GPU adapter");
@@ -4174,7 +4317,7 @@ mod test {
             pub fn init(rx) {
                 let wgsl = rx.read_file("test.wgsl").unwrap();
                 let shader = rx.create_shader(wgsl).unwrap();
-                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
                 let source = rx.create_texture(4, 4).unwrap();
                 source.fill(rx::rgb(0, 0, 255));
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
@@ -4289,7 +4432,7 @@ mod test {
             pub fn init(rx) {
                 let wgsl = rx.read_file("test.wgsl").unwrap();
                 let shader = rx.create_shader(wgsl).unwrap();
-                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+                let pipeline = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
                 let source = rx.create_texture(4, 4).unwrap();
                 source.fill(rx::rgb(0, 0, 255));
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
@@ -4611,11 +4754,11 @@ mod test {
             pub fn init(rx) {
                 let wgsl = rx.read_file("invert.wgsl").unwrap();
                 let shader = rx.create_shader(wgsl).unwrap();
-                let pipeline = rx.create_compute_pipeline(shader, "cs_main").unwrap();
+                let pipeline = rx.create_compute_pipeline(shader, "cs_main", 1).unwrap();
                 let input = rx.create_texture(8, 8).unwrap();
                 input.fill(rx::rgb(255, 0, 0));
                 let output = rx.create_texture(8, 8).unwrap();
-                let bg = rx.create_compute_bind_group(input, output).unwrap();
+                let bg = rx.create_compute_bind_group([input], output).unwrap();
                 #{ pipeline, input, output, bg }
             }
             pub fn shade(state, rx, encoder) {

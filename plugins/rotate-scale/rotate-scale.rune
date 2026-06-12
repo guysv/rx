@@ -21,7 +21,7 @@ const PIVOT_HALF = 6.0;
 pub fn init(rx) {
     let wgsl = rx.read_file("nearest.wgsl").unwrap();
     let shader = rx.create_shader(wgsl).unwrap();
-    let nearest = rx.create_render_pipeline(shader, "vs_main", "fs_main", true).unwrap();
+    let nearest = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
 
     rx.declare_setting("rotate-scale/algo", "");
 
