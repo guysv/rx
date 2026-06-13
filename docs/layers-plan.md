@@ -1,9 +1,9 @@
 # Layers in core: plan for phases 35+
 
 **layer support in the editor core**, with the script API tier on top. It
-takes the P35+ numbering; the parked easymetric plan (stashed, was P35–P41)
-renumbers when revived — and lands better for the wait, since its
-"per-layer geometry" maps onto real layers.
+takes the P35+ numbering; the easymetric plan (`docs/easymetric-plan.md`,
+revived at P40+) renumbered for the wait — and landed better for it, since
+its "per-layer geometry" maps onto the real layers built here.
 
 **Out of scope: persistence.** Frames set the precedent — rx has no
 frame manifest either: a save writes the sheet PNG as-is and `:slice`
@@ -83,17 +83,19 @@ Findings and deviations, in phase order:
   staging z-split never shifts. Test-authoring finding: mode-specific
   default bindings (`h`/`l` = frames) beat General-tier `map`s — test
   keys must dodge them.
-- **P39 (script tier): read side partially landed; the rest still
-  deferred.** The trigger arrived — the `layer-status` overlay plugin
-  (`plugins/layer-status/`) wants to read layer state — so `ViewInfo`
-  now carries `nlayers` and `active_layer`, and `layer_visibility(id)`
-  returns the per-layer `visible` flags (bottom strip first). That is
-  the whole read surface added; everything else stays deferred until a
-  plugin needs it. Current de-facto semantics, unchanged: `view_pixels`
-  and `clear_view_rect` stay display-space (bottom-strip reads / routed
-  writes respectively), `begin_view_pass`/`view_bind_group` see the raw
-  sheet, `view_layer_pixels` and per-layer opacity exposure are unbuilt,
-  views only (the degeneracy the suite proves).
+- **P39 (script tier): read side landed incrementally as plugins
+  needed it.** First the `layer-status` overlay plugin
+  (`plugins/layer-status/`) drove `ViewInfo.nlayers`/`active_layer` and
+  `layer_visibility(id)` (per-layer `visible`, bottom strip first). Then
+  EasyMetric (`docs/easymetric-plan.md`, P42) drove the last specced read,
+  **`view_layer_pixels(id, layer, rect)`** — `view_pixels` lifted by
+  `layer*fh` into a chosen strip, since `view_pixels` reaches only the
+  bottom strip and a plugin needed to introspect a non-active layer on the
+  CPU. Current semantics: `view_pixels`/`clear_view_rect` stay
+  display-space (bottom-strip reads / routed writes), `view_layer_pixels`
+  reads any strip, `begin_view_pass`/`view_bind_group` see the raw sheet,
+  per-layer *opacity* exposure stays unbuilt (no customer yet), and the
+  (the degeneracy the suite proves).
 
 ## The design, in five mechanisms
 

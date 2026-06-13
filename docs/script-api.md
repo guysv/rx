@@ -80,6 +80,7 @@ hook) are y-down, origin top-left.
 | `rx.active_view_id() -> i64` | |
 | `rx.views() -> Vec<ViewInfo>` | snapshots, in view order |
 | `rx.view_pixels(id, rect) -> Option<Bytes>` | rgba8, row-major, from the *recorded snapshot* (see conventions); rect clamped |
+| `rx.view_layer_pixels(id, layer, rect) -> Option<Bytes>` | like `view_pixels`, but a specific layer strip (`0` = bottom); `rect` is display-space (one frame, `y` in `0..fh`). `None` for a missing view/layer. The per-layer CPU read for introspecting a non-active strip |
 | `rx.layer_visibility(id) -> Vec<bool>` | per-layer `visible`, bottom strip first; empty if the view doesn't exist |
 | `rx.touch_view(id)` | mark modified → contents re-recorded (do this after painting a view via a pass) |
 | `rx.clear_view_rect(rect)` | clear a rect of the active view to transparent — a recorded paint |
