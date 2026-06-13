@@ -1,0 +1,204 @@
+// layer-status: an overlay of the active view's layers, anchored to the
+// screen's right edge and vertically centred. Each layer is a row showing a
+// visibility icon (eye-open / eye-closed) driven by its real `visible`
+// attribute; the active layer's row is boxed. Clicking an eye toggles that
+// layer's visibility (UX is WIP).
+//
+// create_texture -> create_sprite_vertices_src, drawn in the `render` hook
+// `mouse_input` hook carries no coords) and toggles via `run_builtin`.
+//
+// The icon atlas (layers.png) is 64x16: four 16x16 cells — eye-open,
+// eye-closed, lock-open, lock-closed. rx layers have no lock state yet, so
+// only the two eye cells are used; the lock cells ride along unused.
+
+const ICON = 16.0;   // atlas cell size (square)
+const PAD = 6.0;     // vertical gap between rows
+const MARGIN = 12.0; // gap from the screen's right edge
+const STACK = 5.0;   // per-row upward tuck — fakes a 3d card stack
+
+const EYE_OPEN = 0.0;   // cell 0
+const EYE_CLOSED = 1.0; // cell 1
+
+pub fn init(rx) {
+    let shader = rx.create_shader(rx.read_file("sprite.wgsl").unwrap()).unwrap();
+    let show = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
+
+    let (w, h, px) = rx.read_png("layers.png").unwrap();
+    let icons = rx.create_texture(w, h).unwrap();
+    icons.upload(px);
+
+    // On/off gate, parallel to the builtin `ui/*` toggles.
+    rx.declare_setting("layer-status/show", true);
+
+    // `mx`/`my` track the cursor (window-logical) from `cursor_moved`, so
+    // `mouse_input` — which carries no coords — can hit-test the icons.
+    #{ show, icons, mx: 0.0, my: 0.0 }
+}
+
+// The active view's ViewInfo, or `None` if there isn't one.
+fn active_view(rx) {
+    let id = rx.active_view_id();
+    for v in rx.views() {
+        if v.id == id {
+            return Some(v);
+        }
+    }
+    None
+}
+
+// Geometry of the layer list for `n` layers on an `sh`-tall, `sw`-wide
+// screen: (x of the icon column, y of the top row, row pitch).
+fn layout(sw, sh, n) {
+    let row_h = ICON + PAD;
+    let y0 = (sh - (n as f64) * row_h) / 2.0;
+    let x = sw - ICON - MARGIN;
+    (x, y0, row_h)
+}
+
+// The eye icon's screen rect (x0, y0, x1, y1) for `row`. The single source
+// of truth shared by `render` (sprite dst) and `mouse_input` (hit-test).
+fn icon_rect(x, y0, row_h, row) {
+    let y = y0 + (row as f64) * (row_h - STACK);
+    (x, y, x + ICON, y + ICON)
+}
+
+// Whether (px, py) falls inside rect `r` = (x0, y0, x1, y1).
+fn hit(r, px, py) {
+    px >= r.0 && px < r.2 && py >= r.1 && py < r.3
+}
+
+// The icon column: one eye per layer, layer 0 at the top of the list and
+// the highest layer at the bottom (the front of the stack). y runs down.
+pub fn render(state, rx, pass) {
+    if !rx.setting("layer-status/show") {
+        return;
+    }
+    let view = active_view(rx);
+    if view.is_none() {
+        return;
+    }
+    let view = view.unwrap();
+    let n = view.nlayers;
+    let vis = rx.layer_visibility(view.id);
+
+    let (sw, sh) = rx.screen_size();
+    let (x, y0, row_h) = layout(sw as f64, sh as f64, n);
+
+    let tbg = rx.create_transform_bind_group(sw, sh, rx::mat4_identity()).unwrap();
+    let sbg = rx.create_texture_bind_group(state.icons).unwrap();
+    pass.set_pipeline(state.show).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+
+    for row in 0..n {
+        let layer = row;
+        let cell = if vis[layer] { EYE_OPEN } else { EYE_CLOSED };
+        let src = rx::rect(cell * ICON, 0.0, cell * ICON + ICON, ICON);
+        let r = icon_rect(x, y0, row_h, row);
+        let dst = rx::rect(r.0, r.1, r.2, r.3);
+        let v = rx.create_sprite_vertices_src(state.icons, src, dst).unwrap();
+        pass.set_vertex_buffer(0, v).unwrap();
+        pass.draw(v.count(), 1).unwrap();
+    }
+}
+
+// Track the cursor (window-logical) so `mouse_input` can hit-test.
+pub fn cursor_moved(state, rx, x, y) {
+    state.mx = x;
+    state.my = y;
+}
+
+// Click an eye to toggle that layer's visibility. The overlay sits off-view
+// at the right edge, so these clicks don't paint; we read the layer's
+// current state and drive the builtin hide/show for that index.
+pub fn mouse_input(state, rx, button, input) {
+    if !rx.setting("layer-status/show") || button != "left" || input != "pressed" {
+        return;
+    }
+    let view = active_view(rx);
+    if view.is_none() {
+        return;
+    }
+    let view = view.unwrap();
+    let n = view.nlayers;
+    let vis = rx.layer_visibility(view.id);
+
+    let (sw, sh) = rx.screen_size();
+    let (x, y0, row_h) = layout(sw as f64, sh as f64, n);
+
+    for row in 0..n {
+        if hit(icon_rect(x, y0, row_h, row), state.mx, state.my) {
+            let cmd = if vis[row] { "hide" } else { "show" };
+            rx.run_builtin(`layer/${cmd} ${row}`);
+            return; // one toggle per click
+        }
+    }
+}
+
+const IDX_W = 16.0; // index column width (2 glyphs @ 8px)
+const GAP = 6.0;    // gap between the index column and the icon
+const FRAME = 3.0;  // horizontal padding from row content to its box
+const VPAD = 1.0;   // vertical padding — tight, so the icon fills the lip
+
+// A card frame: top lip + side rails always; the bottom edge only for the
+// front (bottom) card. Back cards skip it so the card in front of them
+// reads as occluding their lower edge — the 3d-stack illusion. y runs
+// down, so `top` is the smaller y.
+fn draw_frame(rx, x0, top, x1, bottom, color, draw_bottom) {
+    rx.draw_line((x0, top), (x1, top), color); // top lip
+    rx.draw_line((x1, top), (x1, bottom), color); // right rail
+    rx.draw_line((x0, top), (x0, bottom), color); // left rail
+    if draw_bottom {
+        rx.draw_line((x0, bottom), (x1, bottom), color);
+    }
+}
+
+// The index column + per-row frames (UI tier): every layer's row is boxed
+// — grey when it's not the active layer, pink when it is — and labelled
+// with its layer index (0 = bottom strip), so the brush's target layer and
+// the stack order both read at a glance.
+pub fn draw(state, rx) {
+    if !rx.setting("layer-status/show") {
+        return;
+    }
+    let view = active_view(rx);
+    if view.is_none() {
+        return;
+    }
+    let view = view.unwrap();
+    let n = view.nlayers;
+
+    let (sw, sh) = rx.screen_size();
+    let (x, y0, row_h) = layout(sw as f64, sh as f64, n);
+    let idx_x = x - GAP - IDX_W;
+
+    let pink = rx::rgb(0xff, 0x33, 0x66);
+    let grey = rx::rgb(0x88, 0x88, 0x88);
+    let white = rx::rgb(0xff, 0xff, 0xff);
+
+    let pitch = row_h - STACK;
+    for row in 0..n {
+        let layer = row;
+        let y = y0 + (row as f64) * pitch;
+        let active = layer == view.active_layer;
+        let front = row == n - 1; // bottom card sits in front of the stack
+
+        // Each card shows its top lip; only the front (bottom) card closes
+        // its bottom — every card above has that edge hidden behind the one
+        // in front of it. Back cards clip their rails to the next card's
+        // lip so they don't poke through.
+        let top = y - VPAD;
+        let bottom = if front { y + ICON + VPAD } else { y + pitch - VPAD };
+
+        rx.draw_text(`${layer}`, idx_x, y + 1.0, if active { pink } else { white });
+        draw_frame(
+            rx,
+            idx_x - FRAME,
+            top,
+            x + ICON + FRAME,
+            bottom,
+            if active { pink } else { grey },
+            front,
+        );
+    }
+}

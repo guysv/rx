@@ -80,13 +80,15 @@ hook) are y-down, origin top-left.
 | `rx.active_view_id() -> i64` | |
 | `rx.views() -> Vec<ViewInfo>` | snapshots, in view order |
 | `rx.view_pixels(id, rect) -> Option<Bytes>` | rgba8, row-major, from the *recorded snapshot* (see conventions); rect clamped |
+| `rx.layer_visibility(id) -> Vec<bool>` | per-layer `visible`, bottom strip first; empty if the view doesn't exist |
 | `rx.touch_view(id)` | mark modified → contents re-recorded (do this after painting a view via a pass) |
 | `rx.clear_view_rect(rect)` | clear a rect of the active view to transparent — a recorded paint |
 | `rx.damage_view(id)` | re-render from the snapshot, discarding unrecorded GPU-side paint (kill a preview) |
 
 `ViewInfo` fields (read-only): `id`, `width` (full sheet:
 `frame_width * frames`), `height`, `offset_x`, `offset_y`, `zoom`,
-`frames`, `frame_width`, `frame_height`.
+`frames`, `frame_width`, `frame_height`, `nlayers` (1 for a flat view),
+`active_layer` (`0` is the bottom strip).
 
 ## Selection
 

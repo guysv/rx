@@ -1,0 +1,14 @@
+set ui/message = off
+set ui/status = off
+set ui/view-info = off
+set ui/switcher = off
+set ui/cursor = off
+set ui/palette = off
+
+set input/mouse = off
+
+map a :layer/add
+map n :layer/next
+map i :layer/hide
+map s :layer/show
+map x :set layer-status/show = off

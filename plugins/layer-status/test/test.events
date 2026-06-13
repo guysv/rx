@@ -1,0 +1,23 @@
+00030 0000150 cursor/moved 100 100
+00090 0000450 keyboard/input a pressed
+00090 0000450 char/received 'a'
+00102 0000510 keyboard/input a released
+00150 0000750 keyboard/input a pressed
+00150 0000750 char/received 'a'
+00162 0000810 keyboard/input a released
+00210 0001050 keyboard/input n pressed
+00210 0001050 char/received 'n'
+00222 0001110 keyboard/input n released
+00270 0001350 keyboard/input n pressed
+00270 0001350 char/received 'n'
+00282 0001410 keyboard/input n released
+00330 0001650 keyboard/input i pressed
+00330 0001650 char/received 'i'
+00342 0001710 keyboard/input i released
+00390 0001950 keyboard/input s pressed
+00390 0001950 char/received 's'
+00402 0002010 keyboard/input s released
+00450 0002250 keyboard/input x pressed
+00450 0002250 char/received 'x'
+00462 0002310 keyboard/input x released
+00520 0002600 cursor/moved 101 101
