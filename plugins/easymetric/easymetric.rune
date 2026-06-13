@@ -598,7 +598,7 @@ pub fn render(state, rx, pass) {
     let z = view.zoom;
     let x = ox + view.offset_x + (view.width as f64) * z + 8.0;
     let y = oy + view.offset_y;
-    let t = rx::mat4_translation(x, y);
+    let t = rx::mat4_mul(rx::mat4_translation(x, y), rx::mat4_scale(z, z));
     let tbg = rx.create_transform_bind_group(sw, sh, t).unwrap();
     let sbg = rx.create_texture_bind_group(state.pane_b).unwrap();
     let v = rx.create_sprite_vertices(
