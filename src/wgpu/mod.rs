@@ -529,6 +529,10 @@ pub struct Renderer {
 
     // Pipelines
     sprite_pipeline: wgpu::RenderPipeline,
+    /// Surface-format twin of `sprite_pipeline`, for the debug/replay
+    /// overlay text drawn into the present pass (the swapchain) rather
+    /// than the Rgba8 `screen_texture`.
+    overlay_pipeline: wgpu::RenderPipeline,
     shape_pipeline: wgpu::RenderPipeline,
     shape_replace_pipeline: wgpu::RenderPipeline,
     cursor_pipeline: wgpu::RenderPipeline,
@@ -956,6 +960,70 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             cache: None,
         });
 
+        // Surface-format twin of the sprite pipeline: the present pass
+        // (the swapchain, `surface_format`) draws the debug/replay overlay
+        // text, which `sprite_pipeline` (Rgba8, for `screen_texture`)
+        // can't target — a windowed replay would hit a pipeline/pass
+        // format mismatch otherwise.
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay_pipeline"),
+            layout: Some(&sprite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sprite_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Sprite2dVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 12,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 20,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Unorm8x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 24,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sprite_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Shape pipeline
         let shape_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1213,6 +1281,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             paste,
             sampler,
             sprite_pipeline,
+            overlay_pipeline,
             shape_pipeline,
             shape_replace_pipeline,
             cursor_pipeline,
@@ -1958,10 +2027,14 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                 let overlay_vertices =
                     self.create_sprite_vertices(&self.draw_ctx.overlay_batch.vertices());
                 if let Some((buffer, count)) = overlay_vertices {
-                    // Use BottomLeft ortho for overlay (like GL)
+                    // TopLeft ortho, matching the screen pass and the
+                    // cursor in this same present pass. The glyph quads'
+                    // baked-in dst/src Y flip (sprite::set) assumes this
+                    // origin; a BottomLeft projection (the old GL default)
+                    // renders the text vertically flipped / mirrored.
                     let [overlay_w, overlay_h] = self.screen_texture.size;
                     let overlay_ortho: M44 =
-                        ortho_wgpu(overlay_w, overlay_h, Origin::BottomLeft).into();
+                        ortho_wgpu(overlay_w, overlay_h, Origin::TopLeft).into();
                     let overlay_uniforms = TransformUniforms {
                         ortho: overlay_ortho,
                         transform: identity,
@@ -1990,7 +2063,9 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                             }],
                         });
 
-                    pass.set_pipeline(&self.sprite_pipeline);
+                    // The present pass is the swapchain (surface format),
+                    // so the overlay text uses the surface-format twin.
+                    pass.set_pipeline(&self.overlay_pipeline);
                     pass.set_bind_group(0, &overlay_bind_group, &[]);
                     pass.set_bind_group(1, &font_bind_group, &[]);
                     pass.set_vertex_buffer(0, buffer.slice(..));
