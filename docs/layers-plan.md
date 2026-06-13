@@ -83,12 +83,17 @@ Findings and deviations, in phase order:
   staging z-split never shifts. Test-authoring finding: mode-specific
   default bindings (`h`/`l` = frames) beat General-tier `map`s — test
   keys must dodge them.
-- **P39 (script tier): deferred, out of scope** — to be designed when
-  real plugins want layered views, not speculatively. Current
-  de-facto semantics, documented here until then: `view_pixels` and
-  `clear_view_rect` stay display-space (bottom-strip reads / routed
-  writes respectively), `begin_view_pass`/`view_bind_group` see the
-  single-layer views only (the degeneracy the suite proves).
+- **P39 (script tier): read side partially landed; the rest still
+  deferred.** The trigger arrived — the `layer-status` overlay plugin
+  (`plugins/layer-status/`) wants to read layer state — so `ViewInfo`
+  now carries `nlayers` and `active_layer`, and `layer_visibility(id)`
+  returns the per-layer `visible` flags (bottom strip first). That is
+  the whole read surface added; everything else stays deferred until a
+  plugin needs it. Current de-facto semantics, unchanged: `view_pixels`
+  and `clear_view_rect` stay display-space (bottom-strip reads / routed
+  writes respectively), `begin_view_pass`/`view_bind_group` see the raw
+  sheet, `view_layer_pixels` and per-layer opacity exposure are unbuilt,
+  views only (the degeneracy the suite proves).
 
 ## The design, in five mechanisms
 

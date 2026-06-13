@@ -137,6 +137,12 @@ fn mode_vis() {
 }
 
 #[test]
+#[ignore = "layer-status UX is WIP (3d card stack, click-to-toggle); digest not stable yet"]
+fn layer_status() {
+    plugin_test("layer-status");
+}
+
+#[test]
 fn cmd_script() {
     test("cmd-script");
 }

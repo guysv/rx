@@ -1370,8 +1370,22 @@ impl Ctx {
                 frames: v.animation.len() as i64,
                 frame_width: v.fw as i64,
                 frame_height: v.fh as i64,
+                nlayers: v.nlayers as i64,
+                active_layer: v.active_layer as i64,
             })
             .collect()
+    }
+
+    /// Per-layer visibility for a view, bottom strip first (index `0`).
+    /// `nlayers` long; an empty vec if the view doesn't exist.
+    #[rune::function]
+    fn layer_visibility(&self, id: i64) -> Vec<bool> {
+        use crate::view::ViewId;
+
+        match self.session().views.get(ViewId::from(id as u16)) {
+            Some(v) => v.layer_attrs.iter().map(|a| a.visible).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// A setting's value: bool, integer, float, string or a tuple,
@@ -2406,6 +2420,12 @@ pub struct ViewInfo {
     /// Height of a single animation frame (same as `height`).
     #[rune(get)]
     pub frame_height: i64,
+    /// Number of layers (1 for a flat view).
+    #[rune(get)]
+    pub nlayers: i64,
+    /// Index of the active layer (`0` is the bottom strip).
+    #[rune(get)]
+    pub active_layer: i64,
 }
 
 /// The native `rx` module installed into every plugin's context.
@@ -2430,6 +2450,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::message)?;
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
+    m.function_meta(Ctx::layer_visibility)?;
     m.function_meta(Ctx::setting)?;
     m.function_meta(Ctx::set_setting)?;
     m.function_meta(Ctx::declare_setting)?;
@@ -3576,6 +3597,39 @@ mod test {
         assert_eq!((frames, fw, fh), (3, 128, 96));
         // `width` is the full sheet: fw * frames.
         assert_eq!((w, h), (3 * 128, 96));
+    }
+
+    #[test]
+    fn view_info_layer_metadata() {
+        use crate::cmd::Command;
+        use crate::view::FileStatus;
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 128, 96);
+        // Three layers, active on the middle one, top layer hidden.
+        session.command(Command::LayerAdd);
+        session.command(Command::LayerAdd);
+        session.command(Command::LayerSet(1));
+        session.command(Command::LayerHide(Some(2)));
+
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let v = rx.views()[0];
+                    (v.nlayers, v.active_layer, rx.layer_visibility(v.id))
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (nlayers, active, vis): (i64, i64, Vec<bool>) = rune::from_value(v).unwrap();
+        assert_eq!((nlayers, active), (3, 1));
+        // Bottom strip first: layers 0 and 1 visible, top (2) hidden.
+        assert_eq!(vis, vec![true, true, false]);
     }
 
     #[test]
