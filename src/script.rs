@@ -1354,6 +1354,52 @@ impl Ctx {
         rune::runtime::Bytes::from_slice(&bytes).ok()
     }
 
+    /// Read one *layer strip's* pixels in the given rect (rgba8 bytes,
+    /// row-major, row 0 = top). `rect` is display-space — a single frame,
+    /// `y` in `0..fh`, y-up — and `layer` is the strip index (`0` = bottom
+    /// strip). Unlike `view_pixels`, which reaches only the bottom strip
+    /// (display-space / active-routed writes), this addresses any strip:
+    /// the per-layer read a plugin needs to introspect a non-active layer
+    /// on the CPU (EasyMetric's carve/scan probes). `None` if the view or
+    /// layer doesn't exist, or the rect misses the frame.
+    #[rune::function]
+    fn view_layer_pixels(
+        &mut self,
+        id: i64,
+        layer: i64,
+        rect: &Rect,
+    ) -> Option<rune::runtime::Bytes> {
+        use crate::gfx::rect::Rect as GfxRect;
+        use crate::view::ViewId;
+
+        let session = self.session();
+        let v = session.views.get(ViewId::from(id as u16))?;
+        if layer < 0 || layer as usize >= v.nlayers {
+            return None;
+        }
+        // Clamp the request to one frame strip (display bounds), then lift
+        // it into the layer's rows of the sheet (strip n = sheet-space
+        // y-up rows `n*fh .. (n+1)*fh`).
+        let r = GfxRect::new(
+            rect.x1.min(rect.x2) as i32,
+            rect.y1.min(rect.y2) as i32,
+            rect.x1.max(rect.x2) as i32,
+            rect.y1.max(rect.y2) as i32,
+        );
+        if !r.intersects(v.layer_bounds()) {
+            return None;
+        }
+        let r = r.intersection(v.layer_bounds());
+        let off = layer as i32 * v.fh as i32;
+        let sheet = GfxRect::new(r.x1, r.y1 + off, r.x2, r.y2 + off);
+        let (_, pixels) = v.resource.layer.get_snapshot_rect(&sheet)?;
+        let mut bytes = Vec::with_capacity(pixels.len() * 4);
+        for px in &pixels {
+            bytes.extend_from_slice(&[px.r, px.g, px.b, px.a]);
+        }
+        rune::runtime::Bytes::from_slice(&bytes).ok()
+    }
+
     /// Snapshots of all views, in view order.
     #[rune::function]
     fn views(&self) -> Vec<ViewInfo> {
@@ -2445,6 +2491,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::active_view_coords)?;
     m.function_meta(Ctx::touch_view)?;
     m.function_meta(Ctx::view_pixels)?;
+    m.function_meta(Ctx::view_layer_pixels)?;
     m.function_meta(Ctx::clear_view_rect)?;
     m.function_meta(Ctx::damage_view)?;
     m.function_meta(Ctx::message)?;
@@ -3630,6 +3677,44 @@ mod test {
         assert_eq!((nlayers, active), (3, 1));
         // Bottom strip first: layers 0 and 1 visible, top (2) hidden.
         assert_eq!(vis, vec![true, true, false]);
+    }
+
+    #[test]
+    fn view_layer_pixels_reads_and_guards() {
+        use crate::view::FileStatus;
+
+        // Single-layer view: strip 0 is the whole sheet. (The multi-strip
+        // offset math rides real snapshots, exercised by the easymetric
+        // replay; a bare unit-test session has no recorded snapshot at the
+        // grown extent after LayerAdd.)
+        let mut session = test_session().with_blank(FileStatus::NoFile, 8, 8);
+
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let id = rx.active_view_id();
+                    let l0 = rx.view_layer_pixels(id, 0, rx::rect(0.0, 0.0, 8.0, 8.0));
+                    let oob = rx.view_layer_pixels(id, 1, rx::rect(0.0, 0.0, 8.0, 8.0));
+                    let neg = rx.view_layer_pixels(id, -1, rx::rect(0.0, 0.0, 8.0, 8.0));
+                    let sub = rx.view_layer_pixels(id, 0, rx::rect(2.0, 2.0, 5.0, 6.0));
+                    (l0.unwrap().len(), oob.is_none(), neg.is_none(), sub.unwrap().len())
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let v = script.call("probe", (&mut ctx,)).unwrap();
+        let (l0, oob, neg, sub): (i64, bool, bool, i64) = rune::from_value(v).unwrap();
+        // The full strip is 8*8 rgba8 = 256 bytes.
+        assert_eq!(l0, 256);
+        // Out-of-range and negative strips read None.
+        assert!(oob && neg);
+        // The sub-rect is 3 wide * 4 tall * 4 bytes = 48.
+        assert_eq!(sub, 48);
     }
 
     #[test]
