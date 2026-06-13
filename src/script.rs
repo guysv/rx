@@ -1663,6 +1663,33 @@ impl Ctx {
         }
     }
 
+    /// Read an 8-bit RGBA PNG relative to the plugin's directory (e.g.
+    /// a cursor or icon asset) into `(w, h, pixels)` — row-major rgba8
+    /// bytes, the layout `upload` and `write_png` use. `None` (with a
+    /// message) if it can't be read or decoded.
+    #[rune::function]
+    fn read_png(&mut self, path: &str) -> Option<(i64, i64, rune::runtime::Bytes)> {
+        let p = std::path::Path::new(path);
+        let resolved = if p.is_relative() {
+            match &self.root {
+                Some(root) => root.join(p),
+                None => p.to_path_buf(),
+            }
+        } else {
+            p.to_path_buf()
+        };
+        match crate::image::load(&resolved) {
+            Ok((pixels, w, h)) => {
+                let bytes = rune::runtime::Bytes::from_slice(&pixels).ok()?;
+                Some((w as i64, h as i64, bytes))
+            }
+            Err(e) => {
+                self.error(format!("{}", e));
+                None
+            }
+        }
+    }
+
     /// Compile a WGSL shader. `None` (with the compile error in the
     /// message line) on failure.
     #[rune::function]
@@ -2345,6 +2372,12 @@ fn rgb(r: i64, g: i64, b: i64) -> crate::gfx::color::Rgba8 {
     crate::gfx::color::Rgba8::new(r as u8, g as u8, b as u8, 0xff)
 }
 
+/// Construct a color from RGBA components. Alpha blends in `draw_line`
+#[rune::function]
+fn rgba(r: i64, g: i64, b: i64, a: i64) -> crate::gfx::color::Rgba8 {
+    crate::gfx::color::Rgba8::new(r as u8, g as u8, b as u8, a as u8)
+}
+
 /// An immutable snapshot of a view, handed to scripts. Mutation goes
 /// through session methods by id — live references never cross the
 /// boundary (docs/rune-plan.md).
@@ -2415,6 +2448,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::texture_pixels)?;
     m.function_meta(Ctx::write_png)?;
     m.function_meta(Ctx::read_file)?;
+    m.function_meta(Ctx::read_png)?;
     m.function_meta(Ctx::create_shader)?;
     m.function_meta(Ctx::create_render_pipeline)?;
     m.function_meta(Ctx::create_point_pipeline)?;
@@ -2424,6 +2458,7 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::create_sprite_vertices)?;
     m.function_meta(Ctx::create_sprite_vertices_src)?;
     m.function_meta(rgb)?;
+    m.function_meta(rgba)?;
     m.function_meta(rect)?;
     m.function_meta(mat4_identity)?;
     m.function_meta(mat4_translation)?;
@@ -4142,6 +4177,32 @@ mod test {
         // Optional argument omitted; state persists across calls.
         host.dispatch_command(&mut session, "greet", "moon");
         assert_eq!(session.message.to_string(), "hi moon (#2)");
+    }
+
+    #[test]
+    fn read_png_decodes_plugin_relative_rgba() {
+        use crate::gfx::color::Rgba8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pixels = vec![Rgba8::new(1, 2, 3, 4); 6];
+        crate::image::save_as(dir.path().join("img.png"), 3, 2, 1, &pixels).unwrap();
+
+        let (mut host, mut session) = host_with(
+            dir.path(),
+            "p",
+            r#"
+            pub fn init(rx) {
+                rx.register_command("png/stat", [], "Read the fixture png", stat);
+                #{}
+            }
+            pub fn stat(state, rx, args) {
+                let (w, h, px) = rx.read_png("img.png").unwrap();
+                rx.message(`png ${w}x${h} ${px.len()}`);
+            }
+            "#,
+        );
+        host.dispatch_command(&mut session, "png/stat", "");
+        assert_eq!(session.message.to_string(), "png 3x2 24");
     }
 
     #[test]

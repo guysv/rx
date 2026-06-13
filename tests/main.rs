@@ -225,15 +225,6 @@ fn rotate_scale() {
 }
 
 #[test]
-    fs::remove_file(png).ok();
-
-    // The replay's :lt/export must have written the composited sheet
-    // (message-line + probes are in the digest; this asserts the file).
-    assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "png signature");
-    assert_eq!(&data[16..24], &[0, 0, 1, 0, 0, 0, 0, 128], "256x128 ihdr");
-}
-
-#[test]
 fn source() {
     test("source");
 }

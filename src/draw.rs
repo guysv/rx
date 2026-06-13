@@ -76,6 +76,10 @@ pub mod cursors {
             (Mode::Help, Tool::Brush) => {}
             (Mode::Help, _) => return None,
             (Mode::Present, _) => return None,
+            // Script modes own the cursor: builtin input is inert
+            // there, so the builtin cursor is too — a plugin that
+            // wants one draws its own in its `render` hook.
+            (Mode::Script(_), _) => return None,
             _ => {}
         }
         let cursor = match t {
