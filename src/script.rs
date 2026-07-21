@@ -5880,8 +5880,7 @@ mod test {
         };
         let dir = tempfile::tempdir().unwrap();
         let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
-        std::os::unix::fs::symlink(plugins.join("rotsprite"), dir.path().join("rotsprite")).unwrap();
-        std::os::unix::fs::symlink(plugins.join("mmpx"), dir.path().join("mmpx")).unwrap();
+        std::os::unix::fs::symlink(plugins.join("rotate-scale"), dir.path().join("rotate-scale")).unwrap();
         write_plugin(
             dir.path(),
             "driver",
@@ -5891,9 +5890,22 @@ mod test {
                 let src = rx.create_texture(8, 8).unwrap();
                 src.fill(rx::rgb(255, 0, 0));
                 let target = rx.create_texture(64, 64).unwrap();
-                rx.call_plugin("rotsprite", "render_pass",
+                rx.call_plugin("rotate-scale", "rotsprite",
                     [encoder, rx::mat4_identity(), target, src,
                      rx::rect(0.0, 0.0, 64.0, 64.0), 64, 64]).unwrap();
+            }
+            "#,
+        );
+        write_plugin(
+            dir.path(),
+            "external",
+            r#"
+            pub fn init(rx) {
+                rx.export("render_pass", render_pass);
+                #{}
+            }
+            pub fn render_pass(state, rx, args) {
+                rx.call_plugin("rotate-scale", "mmpx", args).unwrap();
             }
             "#,
         );
@@ -5928,6 +5940,22 @@ mod test {
             "mmpx chain must not error: {}",
             session.message
         );
+
+        // An arbitrary plugin name still delegates each x2 pass through
+        // the historical external `render_pass` contract.
+        session
+            .settings
+            .set("rotsprite/algo", crate::cmd::Value::Ident("external".into()))
+            .unwrap();
+        let encoder = gfx.device.create_command_encoder(&Default::default());
+        let encoder = host.dispatch_shade(&mut session, encoder, ViewTargets::new());
+        gfx.queue.submit(std::iter::once(encoder.finish()));
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            3,
+            "external x2 chain must not error: {}",
+            session.message
+        );
     }
 
     #[test]
@@ -5942,15 +5970,13 @@ mod test {
         };
         let dir = tempfile::tempdir().unwrap();
         let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
-        for p in ["rotate-scale", "cleanedge"] {
-            std::os::unix::fs::symlink(plugins.join(p), dir.path().join(p)).unwrap();
-        }
+        std::os::unix::fs::symlink(plugins.join("rotate-scale"), dir.path().join("rotate-scale")).unwrap();
 
         let mut session = test_session().with_blank(FileStatus::NoFile, 128, 128);
         let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
         host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
         host.load(&mut session);
-        assert_eq!(host.plugins().count(), 2, "plugins must load: {}", session.message);
+        assert_eq!(host.plugins().count(), 1, "plugin must load: {}", session.message);
 
         // Content + selection.
         let mut pixels = vec![Rgba8::TRANSPARENT; 128 * 128];
@@ -6017,7 +6043,7 @@ mod test {
         draw(&mut host, &mut session);
         assert_eq!(
             host.plugins().filter(|p| p.enabled).count(),
-            2,
+            1,
             "draw must be repeatable: {}",
             session.message
         );
@@ -6042,6 +6068,10 @@ mod test {
         shade(&mut host, &mut session);
 
         // Apply, then leave the mode.
+        session
+            .settings
+            .set("rotate-scale/algo", crate::cmd::Value::Ident("cleanedge".into()))
+            .unwrap();
         host.dispatch_command(&mut session, "rotate/apply", "");
         shade(&mut host, &mut session);
         session.switch_mode(Mode::Normal);
@@ -6049,8 +6079,8 @@ mod test {
 
         assert_eq!(
             host.plugins().filter(|p| p.enabled).count(),
-            2,
-            "plugins must survive the whole flow: {}",
+            1,
+            "plugin must survive the whole flow: {}",
             session.message
         );
         // The selection moved with the transform and survives the

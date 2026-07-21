@@ -7,8 +7,8 @@
 // the transformed selection previews in the view's staging texture
 // every frame; <return> (:rotate/apply) stamps it into the view as a
 // recorded, undoable edit; escape cancels. The `rotate-scale/algo`
-// setting names an interface plugin (cleanedge, mmpx, rotsprite) to
-// sample with; the default is nearest neighbor.
+// setting selects nearest, cleanedge, mmpx, or rotsprite. Any other
+// non-empty value names an external interface plugin.
 //
 // State note: long-lived state avoids `Option` — Rune's `unwrap` takes
 // the inner value out of a shared Option, poisoning it for the next
@@ -19,11 +19,26 @@ const SCALE_MODE = "visual (scale)";
 const PIVOT_HALF = 6.0;
 
 pub fn init(rx) {
-    let wgsl = rx.read_file("nearest.wgsl").unwrap();
-    let shader = rx.create_shader(wgsl).unwrap();
-    let nearest = rx.create_render_pipeline(shader, "vs_main", "fs_main", 1).unwrap();
+    let nearest_shader = rx.create_shader(rx.read_file("nearest.wgsl").unwrap()).unwrap();
+    let nearest = rx.create_render_pipeline(nearest_shader, "vs_main", "fs_main", 1).unwrap();
+    let cleanedge_shader = rx.create_shader(rx.read_file("cleanedge.wgsl").unwrap()).unwrap();
+    let cleanedge = rx.create_render_pipeline(cleanedge_shader, "vs_main", "fs_main", 1).unwrap();
+    let mmpx_shader = rx.create_shader(rx.read_file("mmpx.wgsl").unwrap()).unwrap();
+    let mmpx = rx.create_render_pipeline(mmpx_shader, "vs_main", "fs_mmpx", 1).unwrap();
+    let rotsprite_shader = rx.create_shader(rx.read_file("rotsprite.wgsl").unwrap()).unwrap();
+    let rotsprite_epx = rx.create_render_pipeline(rotsprite_shader, "vs_main", "fs_epx", 1).unwrap();
+    let rotsprite_final = rx.create_render_pipeline(rotsprite_shader, "vs_main", "fs_final", 1).unwrap();
 
     rx.declare_setting("rotate-scale/algo", "");
+    // Selects RotSprite's internal x2 pass. Empty means EPX; built-in
+    // names resolve locally and any other value delegates to a plugin.
+    rx.declare_setting("rotsprite/algo", "");
+
+    // Other plugins can use the bundled algorithms without installing
+    // three separate interface plugins.
+    rx.export("cleanedge", cleanedge_render_pass);
+    rx.export("mmpx", mmpx_render_pass);
+    rx.export("rotsprite", rotsprite_render_pass);
 
     rx.register_command("selection/rotate", [], "Rotate the selection", selection_rotate);
     rx.register_command_repeating("rotate/set", ["float"], "Set selection rotation (degrees)", rotate_set);
@@ -47,6 +62,10 @@ pub fn init(rx) {
 
     #{
         nearest,
+        cleanedge,
+        mmpx,
+        rotsprite_epx,
+        rotsprite_final,
         rotation_degrees: 0.0,
         scale_x: 1.0,
         scale_y: 1.0,
@@ -375,6 +394,91 @@ fn active_view(state, rx) {
 // Draw & shade
 // ---------------------------------------------------------------------------
 
+// The bundled render-pass implementations use the same argument contract as
+// external interface plugins:
+// [encoder, transform, target, source, dst, ortho_w, ortho_h].
+
+fn sprite_pass(rx, encoder, pipeline, label, transform, target, source, dst, ortho_w, ortho_h, clear) {
+    let tbg = rx.create_transform_bind_group(ortho_w, ortho_h, transform).unwrap();
+    let sbg = rx.create_texture_bind_group(source).unwrap();
+    let verts = rx.create_sprite_vertices(source, dst, rx::rgb(255, 255, 255), 1.0).unwrap();
+    let load = if clear { "clear" } else { "load" };
+    let pass = if target is i64 {
+        encoder.begin_view_pass(label, target, "load").unwrap()
+    } else {
+        encoder.begin_render_pass(label, target, load).unwrap()
+    };
+    pass.set_pipeline(pipeline).unwrap();
+    pass.set_bind_group(0, tbg).unwrap();
+    pass.set_bind_group(1, sbg).unwrap();
+    pass.set_vertex_buffer(0, verts).unwrap();
+    pass.draw(verts.count(), 1).unwrap();
+}
+
+pub fn cleanedge_render_pass(state, rx, args) {
+    sprite_pass(rx, args[0], state.cleanedge, "cleanedge", args[1], args[2], args[3], args[4], args[5], args[6], false);
+}
+
+pub fn mmpx_render_pass(state, rx, args) {
+    sprite_pass(rx, args[0], state.mmpx, "mmpx", args[1], args[2], args[3], args[4], args[5], args[6], true);
+}
+
+fn rotsprite_x2(state, rx, encoder, source, target, dst_w, dst_h, algo) {
+    let dst = rx::rect(0.0, 0.0, dst_w as f64, dst_h as f64);
+    if algo == "cleanedge" {
+        sprite_pass(rx, encoder, state.cleanedge, "rotsprite-cleanedge", rx::mat4_identity(), target, source, dst, dst_w, dst_h, true);
+    } else if algo == "mmpx" {
+        sprite_pass(rx, encoder, state.mmpx, "rotsprite-mmpx", rx::mat4_identity(), target, source, dst, dst_w, dst_h, true);
+    } else if algo != "" && algo != "nearest" && algo != "rotsprite" {
+        rx.call_plugin(algo, "render_pass", [encoder, rx::mat4_identity(), target, source, dst, dst_w, dst_h]).unwrap();
+    } else {
+        // Empty and `rotsprite` retain the historical internal EPX pass;
+        // `nearest` provides an explicit plain x2 option.
+        let pipeline = if algo == "nearest" { state.nearest } else { state.rotsprite_epx };
+        sprite_pass(rx, encoder, pipeline, "rotsprite-x2", rx::mat4_identity(), target, source, dst, dst_w, dst_h, true);
+    }
+}
+
+pub fn rotsprite_render_pass(state, rx, args) {
+    let encoder = args[0];
+    let transform = args[1];
+    let target = args[2];
+    let source = args[3];
+    let dst = args[4];
+    let ortho_w = args[5];
+    let ortho_h = args[6];
+    let src_w = source.width();
+    let src_h = source.height();
+    if src_w <= 0 || src_h <= 0 {
+        return;
+    }
+
+    let algo = rx.setting("rotsprite/algo");
+    let algo = if algo is String { algo } else { "" };
+    let tex2 = rx.create_texture(src_w * 2, src_h * 2).unwrap();
+    let tex4 = rx.create_texture(src_w * 4, src_h * 4).unwrap();
+    let tex8 = rx.create_texture(src_w * 8, src_h * 8).unwrap();
+    rotsprite_x2(state, rx, encoder, source, tex2, src_w * 2, src_h * 2, algo);
+    rotsprite_x2(state, rx, encoder, tex2, tex4, src_w * 4, src_h * 4, algo);
+    rotsprite_x2(state, rx, encoder, tex4, tex8, src_w * 8, src_h * 8, algo);
+    sprite_pass(rx, encoder, state.rotsprite_final, "rotsprite-final", transform, target, tex8, dst, ortho_w, ortho_h, false);
+}
+
+fn builtin_render_pass(state, rx, algo, args) {
+    if algo == "cleanedge" {
+        cleanedge_render_pass(state, rx, args);
+        true
+    } else if algo == "mmpx" {
+        mmpx_render_pass(state, rx, args);
+        true
+    } else if algo == "rotsprite" {
+        rotsprite_render_pass(state, rx, args);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn draw(state, rx) {
     let mode = rx.mode();
     if mode != ROTATION_MODE && mode != SCALE_MODE {
@@ -387,7 +491,7 @@ pub fn draw(state, rx) {
     let pink = rx::rgb(0xff, 0x33, 0x66);
     let algo = rx.setting("rotate-scale/algo");
     let algo = if algo is String { algo } else { "" };
-    if algo == "" {
+    if algo == "" || algo == "nearest" {
         rx.draw_text("Algorithm: nearest neighbor (default)", 10.0, 86.0, pink);
     } else {
         rx.draw_text(`Algorithm: ${algo}`, 10.0, 86.0, pink);
@@ -434,13 +538,11 @@ pub fn shade(state, rx, encoder) {
     let algo = rx.setting("rotate-scale/algo");
     let algo = if algo is String { algo } else { "" };
 
-    if algo != "" && to_view {
-        rx.call_plugin(
-            algo,
-            "render_pass",
-            [encoder, transform, state.active_view_id, state.clipboard, dst, view.width, view.height],
-        )
-        .unwrap();
+    if algo != "" && algo != "nearest" && to_view {
+        let args = [encoder, transform, state.active_view_id, state.clipboard, dst, view.width, view.height];
+        if !builtin_render_pass(state, rx, algo, args) {
+            rx.call_plugin(algo, "render_pass", args).unwrap();
+        }
         return;
     }
 

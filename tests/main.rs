@@ -216,21 +216,6 @@ fn selection_outline() {
 }
 
 #[test]
-fn cleanedge() {
-    plugin_test("cleanedge");
-}
-
-#[test]
-fn mmpx() {
-    plugin_test("mmpx");
-}
-
-#[test]
-fn rotsprite() {
-    plugin_test("rotsprite");
-}
-
-#[test]
 fn rotate_scale() {
     plugin_test("rotate-scale");
 }

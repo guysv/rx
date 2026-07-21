@@ -30,7 +30,7 @@ Plugin deps are declared in the toml:
 
 ```toml
 [plugins]
-load = ["rotsprite", "mmpx"]
+load = ["rotate-scale"]
 ```
 
 The harness stages each listed plugin's top-level files, plus any
