@@ -63,6 +63,20 @@ USAGE
 
   See the guide at https://rx.cloudhead.io/guide.html.
 
+PLUGINS
+
+  When run from the repository root, rx loads the in-tree plugins from
+  `plugins/`. Additional out-of-tree plugin directories can be configured in
+  your shell startup file using a PATH-style list:
+
+    export RXX_PLUGIN_PATH="$HOME/src/rxx-lut:$HOME/src/my-rxx-plugins"
+
+  Each listed directory may contain flat `<name>.rune` plugins or packaged
+  `<name>/<name>.rune` plugins. Add `--plugin-dir <dir>` more than once for
+  temporary entries. The search order is command-line directories,
+  `RXX_PLUGIN_PATH`, local `plugins/`, then the user configuration plugin
+  directory. If names collide, the first plugin found wins.
+
 TROUBLESHOOTING
 
   If something isn't working like it's supposed to, there are various things
