@@ -63,6 +63,14 @@ USAGE
 
   See the guide at https://rx.cloudhead.io/guide.html.
 
+PLUGINS
+
+  The in-tree `animation-mode` plugin adds per-view playback orders:
+
+    :animation-mode forward
+    :animation-mode reverse
+    :animation-mode ping-pong
+
 TROUBLESHOOTING
 
   If something isn't working like it's supposed to, there are various things

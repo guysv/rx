@@ -1433,7 +1433,59 @@ impl Ctx {
             return false;
         };
         let n = v.animation.len() as i64;
-        v.animation.index = frame.rem_euclid(n) as usize;
+        v.animation.set_frame(frame.rem_euclid(n) as usize);
+        true
+    }
+
+    /// Set a view's playback sequence. Entries are zero-based frame indices;
+    /// an empty sequence restores natural frame order. Returns false if the
+    /// view does not exist or any entry is outside its frame range.
+    #[rune::function]
+    fn set_animation_sequence(&mut self, id: i64, sequence: Vec<i64>) -> bool {
+        use crate::view::ViewId;
+
+        let Some(v) = self.session_mut().views.get_mut(ViewId::from(id as u16)) else {
+            return false;
+        };
+        let Ok(sequence) = sequence
+            .into_iter()
+            .map(usize::try_from)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return false;
+        };
+        v.animation.set_sequence(sequence)
+    }
+
+    /// The view's custom playback sequence. Empty means natural frame order;
+    /// also empty if the view does not exist.
+    #[rune::function]
+    fn animation_sequence(&self, id: i64) -> Vec<i64> {
+        use crate::view::ViewId;
+
+        self.session()
+            .views
+            .get(ViewId::from(id as u16))
+            .map(|v| {
+                v.animation
+                    .sequence()
+                    .iter()
+                    .map(|&frame| frame as i64)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Restore natural frame-order playback for one view. Returns false if
+    /// the view does not exist.
+    #[rune::function]
+    fn clear_animation_sequence(&mut self, id: i64) -> bool {
+        use crate::view::ViewId;
+
+        let Some(v) = self.session_mut().views.get_mut(ViewId::from(id as u16)) else {
+            return false;
+        };
+        v.animation.clear_sequence();
         true
     }
 
@@ -2529,6 +2581,9 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
     m.function_meta(Ctx::set_animation_frame)?;
+    m.function_meta(Ctx::set_animation_sequence)?;
+    m.function_meta(Ctx::animation_sequence)?;
+    m.function_meta(Ctx::clear_animation_sequence)?;
     m.function_meta(Ctx::set_animation_preview_visible)?;
     m.function_meta(Ctx::layer_visibility)?;
     m.function_meta(Ctx::setting)?;
@@ -3696,6 +3751,86 @@ mod test {
         assert!(hidden);
         assert_eq!(frame, 2, "frame setters wrap by the frame count");
         assert!(!session.active_view().animation_preview_visible);
+    }
+
+    #[test]
+    fn animation_sequence_api_validates_and_round_trips() {
+        use crate::view::FileStatus;
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 16, 16);
+        session.command(crate::cmd::Command::FrameAdd);
+        session.command(crate::cmd::Command::FrameAdd);
+
+        let engine = ScriptEngine::new().unwrap();
+        let script = engine
+            .compile_str(
+                "t",
+                r#"
+                pub fn probe(rx) {
+                    let id = rx.active_view_id();
+                    let set = rx.set_animation_sequence(id, [0, 1, 2, 1]);
+                    let sequence = rx.animation_sequence(id);
+                    let invalid = rx.set_animation_sequence(id, [0, 3]);
+                    let preserved = rx.animation_sequence(id);
+                    let cleared = rx.clear_animation_sequence(id);
+                    (set, sequence, invalid, preserved, cleared, rx.animation_sequence(id))
+                }
+                "#,
+            )
+            .unwrap();
+
+        let mut ctx = Ctx::new(&mut session);
+        let value = script.call("probe", (&mut ctx,)).unwrap();
+        let (set, sequence, invalid, preserved, cleared, after): (
+            bool,
+            Vec<i64>,
+            bool,
+            Vec<i64>,
+            bool,
+            Vec<i64>,
+        ) = rune::from_value(value).unwrap();
+        assert!(set);
+        assert_eq!(sequence, vec![0, 1, 2, 1]);
+        assert!(!invalid);
+        assert_eq!(preserved, sequence);
+        assert!(cleared);
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn animation_mode_stock_plugin_sets_ping_pong_playback() {
+        use crate::view::FileStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/animation-mode/animation-mode.rune");
+        std::fs::copy(source, dir.path().join("animation-mode.rune")).unwrap();
+
+        let mut session = test_session().with_blank(FileStatus::NoFile, 16, 16);
+        for _ in 0..3 {
+            session.command(crate::cmd::Command::FrameAdd);
+        }
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        assert_eq!(host.plugins().filter(|plugin| plugin.enabled).count(), 1);
+
+        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[0, 1, 2, 3, 2, 1]
+        );
+
+        host.dispatch_command(&mut session, "animation-mode", "forward");
+        assert!(session.active_view().animation.sequence().is_empty());
+
+        session.command(crate::cmd::Command::FrameRemove);
+        session.command(crate::cmd::Command::FrameRemove);
+        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        assert_eq!(session.active_view().animation.sequence(), &[0, 1]);
+
+        session.command(crate::cmd::Command::FrameRemove);
+        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        assert_eq!(session.active_view().animation.sequence(), &[0]);
     }
 
     #[test]
