@@ -1414,12 +1414,40 @@ impl Ctx {
                 offset_y: v.offset.y as f64,
                 zoom: v.zoom as f64,
                 frames: v.animation.len() as i64,
+                animation_frame: v.animation.index as i64,
                 frame_width: v.fw as i64,
                 frame_height: v.fh as i64,
                 nlayers: v.nlayers as i64,
                 active_layer: v.active_layer as i64,
             })
             .collect()
+    }
+
+    /// Set a view's current animation frame. The index wraps by the
+    /// view's frame count. Returns false if the view does not exist.
+    #[rune::function]
+    fn set_animation_frame(&mut self, id: i64, frame: i64) -> bool {
+        use crate::view::ViewId;
+
+        let Some(v) = self.session_mut().views.get_mut(ViewId::from(id as u16)) else {
+            return false;
+        };
+        let n = v.animation.len() as i64;
+        v.animation.index = frame.rem_euclid(n) as usize;
+        true
+    }
+
+    /// Show or suppress the workspace's built-in animation preview for
+    /// one view. Specialized preview plugins use this to replace it.
+    #[rune::function]
+    fn set_animation_preview_visible(&mut self, id: i64, visible: bool) -> bool {
+        use crate::view::ViewId;
+
+        let Some(v) = self.session_mut().views.get_mut(ViewId::from(id as u16)) else {
+            return false;
+        };
+        v.animation_preview_visible = visible;
+        true
     }
 
     /// Per-layer visibility for a view, bottom strip first (index `0`).
@@ -2460,6 +2488,9 @@ pub struct ViewInfo {
     /// Number of animation frames (1 for a still).
     #[rune(get)]
     pub frames: i64,
+    /// Zero-based current animation frame.
+    #[rune(get)]
+    pub animation_frame: i64,
     /// Width of a single animation frame.
     #[rune(get)]
     pub frame_width: i64,
@@ -2497,6 +2528,8 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::message)?;
     m.function_meta(Ctx::active_view_id)?;
     m.function_meta(Ctx::views)?;
+    m.function_meta(Ctx::set_animation_frame)?;
+    m.function_meta(Ctx::set_animation_preview_visible)?;
     m.function_meta(Ctx::layer_visibility)?;
     m.function_meta(Ctx::setting)?;
     m.function_meta(Ctx::set_setting)?;
@@ -3653,7 +3686,13 @@ mod test {
                 r#"
                 pub fn probe(rx) {
                     let v = rx.views()[0];
-                    (v.frames, v.frame_width, v.frame_height, v.width, v.height)
+                    let set = rx.set_animation_frame(v.id, 5);
+                    let hidden = rx.set_animation_preview_visible(v.id, false);
+                    let after = rx.views()[0];
+                    (
+                        v.frames, v.frame_width, v.frame_height, v.width, v.height,
+                        set, hidden, after.animation_frame,
+                    )
                 }
                 "#,
             )
@@ -3661,10 +3700,23 @@ mod test {
 
         let mut ctx = Ctx::new(&mut session);
         let v = script.call("probe", (&mut ctx,)).unwrap();
-        let (frames, fw, fh, w, h): (i64, i64, i64, i64, i64) = rune::from_value(v).unwrap();
+        let (frames, fw, fh, w, h, set, hidden, frame): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            bool,
+            bool,
+            i64,
+        ) = rune::from_value(v).unwrap();
         assert_eq!((frames, fw, fh), (3, 128, 96));
         // `width` is the full sheet: fw * frames.
         assert_eq!((w, h), (3 * 128, 96));
+        assert!(set);
+        assert!(hidden);
+        assert_eq!(frame, 2, "frame setters wrap by the frame count");
+        assert!(!session.active_view().animation_preview_visible);
     }
 
     #[test]
