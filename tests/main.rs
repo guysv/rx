@@ -97,6 +97,11 @@ fn frames() {
 }
 
 #[test]
+fn animation_delay() {
+    test("animation-delay");
+}
+
+#[test]
 fn layers() {
     test("layers");
 }
