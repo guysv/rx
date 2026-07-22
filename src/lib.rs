@@ -234,7 +234,7 @@ pub fn init<P: AsRef<Path>>(paths: &[P], options: Options<'_>) -> std::io::Resul
         match session.animation_delay() {
             Some(delay) if session.is_running() => {
                 // How much time is left until the next animation frame?
-                let remaining = delay - session.accumulator;
+                let remaining = delay.saturating_sub(session.accumulator);
                 // If more than 1ms remains, let's wait.
                 if remaining.as_millis() > 1 {
                     events.wait_timeout(remaining);
