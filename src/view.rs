@@ -303,11 +303,18 @@ pub struct View<R> {
 pub struct Animation<T> {
     pub index: usize,
     pub frames: Vec<T>,
+    sequence: Vec<usize>,
+    sequence_index: usize,
 }
 
 impl<T> Animation<T> {
     pub fn new(frames: Vec<T>) -> Self {
-        Self { index: 0, frames }
+        Self {
+            index: 0,
+            frames,
+            sequence: Vec::new(),
+            sequence_index: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -315,11 +322,56 @@ impl<T> Animation<T> {
     }
 
     pub fn step(&mut self) {
-        self.index = (self.index + 1) % self.len();
+        if self.sequence.is_empty() {
+            self.index = (self.index + 1) % self.len();
+        } else {
+            self.sequence_index = (self.sequence_index + 1) % self.sequence.len();
+            self.index = self.sequence[self.sequence_index];
+        }
     }
 
     pub fn val(&self) -> &T {
         &self.frames[self.index % self.len()]
+    }
+
+    /// The custom playback sequence. Empty means natural frame order.
+    pub fn sequence(&self) -> &[usize] {
+        &self.sequence
+    }
+
+    /// Replace the playback sequence, rejecting out-of-range frame indices.
+    /// An empty sequence restores natural frame order.
+    pub fn set_sequence(&mut self, sequence: Vec<usize>) -> bool {
+        if sequence.iter().any(|&frame| frame >= self.len()) {
+            return false;
+        }
+        if sequence.is_empty() {
+            self.clear_sequence();
+            return true;
+        }
+
+        self.sequence_index = sequence
+            .iter()
+            .position(|&frame| frame == self.index)
+            .unwrap_or(0);
+        self.index = sequence[self.sequence_index];
+        self.sequence = sequence;
+        true
+    }
+
+    /// Restore natural frame-order playback without changing the visible frame.
+    pub fn clear_sequence(&mut self) {
+        self.sequence.clear();
+        self.sequence_index = 0;
+    }
+
+    /// Select a visible frame and seek to its first occurrence in the custom
+    /// sequence, when present.
+    pub fn set_frame(&mut self, frame: usize) {
+        self.index = frame % self.len();
+        if let Some(position) = self.sequence.iter().position(|&f| f == self.index) {
+            self.sequence_index = position;
+        }
     }
 }
 
@@ -411,6 +463,7 @@ impl<R> View<R> {
         let fh = self.fh as f32;
 
         self.animation.frames.push(Rect::new(w, 0., w + fw, fh));
+        self.animation.clear_sequence();
 
         self.resized();
     }
@@ -420,6 +473,7 @@ impl<R> View<R> {
         // Don't allow the view to have zero frames.
         if self.animation.len() > 1 {
             self.animation.frames.pop();
+            self.animation.clear_sequence();
             self.resized();
         }
     }
@@ -1071,6 +1125,36 @@ impl<R> ViewManager<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_custom_sequence_steps_and_seeks() {
+        let mut animation = Animation::new(vec!['a', 'b', 'c', 'd']);
+        assert!(animation.set_sequence(vec![0, 1, 2, 3, 2, 1]));
+
+        let mut visited = vec![animation.index];
+        for _ in 0..6 {
+            animation.step();
+            visited.push(animation.index);
+        }
+        assert_eq!(visited, vec![0, 1, 2, 3, 2, 1, 0]);
+
+        animation.set_frame(2);
+        animation.step();
+        assert_eq!(animation.index, 3, "seek uses the first matching entry");
+    }
+
+    #[test]
+    fn animation_sequence_validation_and_clear() {
+        let mut animation = Animation::new(vec!['a', 'b', 'c']);
+        assert!(!animation.set_sequence(vec![0, 3]));
+        assert!(animation.sequence().is_empty());
+
+        assert!(animation.set_sequence(vec![2, 1]));
+        assert_eq!(animation.index, 2, "a sequence may reposition the frame");
+        animation.clear_sequence();
+        animation.step();
+        assert_eq!(animation.index, 0, "natural order resumes from the visible frame");
+    }
 
     #[test]
     fn test_extent_single_layer() {

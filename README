@@ -77,6 +77,12 @@ PLUGINS
   `RXX_PLUGIN_PATH`, local `plugins/`, then the user configuration plugin
   directory. If names collide, the first plugin found wins.
 
+  The in-tree `animation-mode` plugin adds per-view playback orders:
+
+    :animation-mode forward
+    :animation-mode reverse
+    :animation-mode ping-pong
+
 TROUBLESHOOTING
 
   If something isn't working like it's supposed to, there are various things
