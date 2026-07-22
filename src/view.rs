@@ -288,6 +288,9 @@ pub struct View<R> {
     pub state: ViewState,
     /// Animation state of the sprite displayed by this view.
     pub animation: Animation<Rect<f32>>,
+    /// Whether the workspace draws the built-in animation preview pane.
+    /// Plugins may suppress it when they provide a specialized preview.
+    pub animation_preview_visible: bool,
     /// View resource.
     pub resource: R,
 
@@ -362,6 +365,7 @@ impl<R> View<R> {
             flip_y: false,
             file_status: fs,
             animation: Animation::new(frames),
+            animation_preview_visible: true,
             state: ViewState::Okay,
             saved_snapshot,
             resource,

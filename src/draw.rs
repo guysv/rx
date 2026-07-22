@@ -737,6 +737,9 @@ fn draw_paste(session: &Session, batch: &mut sprite2d::Batch) {
 pub fn draw_view_animation<R>(session: &Session, v: &View<R>) -> sprite2d::Batch {
     let sheet_h = v.sheet_height();
     let mut batch = sprite2d::Batch::new(v.width(), sheet_h);
+    if !v.animation_preview_visible {
+        return batch;
+    }
     let frame = *v.animation.val();
     let dst = Rect::new(-(v.fw as f32), 0., 0., v.fh as f32) * v.zoom + (session.offset + v.offset);
 
