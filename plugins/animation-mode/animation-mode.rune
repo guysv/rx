@@ -4,7 +4,7 @@
 
 pub fn init(rx) {
     rx.declare_setting("animation/mode", "forward");
-    #{ last_mode: "forward", last_view: 0, last_frames: -1 }
+    #{ last_mode: "forward", views: [] }
 }
 
 fn apply(rx, view, mode) {
@@ -34,22 +34,43 @@ fn apply(rx, view, mode) {
 }
 
 pub fn update(state, rx) {
-    let mode = rx.setting("animation/mode").to_lowercase();
-    if mode == "pingpong" { mode = "ping-pong"; }
-    if mode != "forward" && mode != "reverse" && mode != "ping-pong" {
+    let requested = rx.setting("animation/mode").to_lowercase();
+    if requested == "pingpong" { requested = "ping-pong"; }
+    if requested != "forward" && requested != "reverse" && requested != "ping-pong" {
         rx.set_setting("animation/mode", state.last_mode.clone());
         rx.message("Invalid animation/mode; use forward, reverse, or ping-pong");
         return;
     }
+
     for view in rx.views() {
         if view.id != rx.active_view_id() { continue; }
-        if mode != state.last_mode || view.id != state.last_view || view.frames != state.last_frames {
-            apply(rx, view, mode);
-            state.last_mode = mode;
-            state.last_view = view.id;
-            state.last_frames = view.frames;
+        let entry = ();
+        let found = false;
+        for saved in state.views {
+            if saved.id == view.id { entry = saved; found = true; }
         }
-        rx.set_setting("animation/mode", mode.clone());
+        if !found {
+            entry = #{ id: view.id, mode: "forward", frames: -1 };
+            state.views.push(entry);
+        }
+        // An explicit setting change applies to the active view. Otherwise,
+        // switching views restores that view's setting without changing it.
+        let mode = if requested != state.last_mode { requested } else { entry.mode };
+        if mode != entry.mode || view.frames != entry.frames {
+            apply(rx, view, mode);
+            entry.mode = mode;
+            entry.frames = view.frames;
+        }
+        rx.set_setting("animation/mode", entry.mode.clone());
+        state.last_mode = entry.mode;
         return;
     }
+}
+
+pub fn view_removed(state, rx, id) {
+    let remaining = [];
+    for entry in state.views {
+        if entry.id != id { remaining.push(entry); }
+    }
+    state.views = remaining;
 }

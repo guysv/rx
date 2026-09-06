@@ -3911,6 +3911,83 @@ mod test {
     }
 
     #[test]
+    fn animation_mode_remembers_each_view_without_restarting() {
+        use crate::view::FileStatus;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/animation-mode/animation-mode.rune"),
+            dir.path().join("animation-mode.rune"),
+        )
+        .unwrap();
+        let mut session = test_session().with_blank(
+            FileStatus::New(crate::view::FileStorage::Single("first.png".into())),
+            16,
+            16,
+        );
+        for _ in 0..3 {
+            session.command(crate::cmd::Command::FrameAdd);
+        }
+        let first = session.views.active_id;
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        host.dispatch_update(&mut session);
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
+        session.views.active_mut().unwrap().animation.set_frame(0);
+        for _ in 0..4 {
+            session.views.active_mut().unwrap().animation.step();
+        }
+
+        session.blank(FileStatus::NoFile, 16, 16);
+        for _ in 0..2 {
+            session.command(crate::cmd::Command::FrameAdd);
+        }
+        let second = session.views.active_id;
+        assert_ne!(first, second);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("forward".into()))
+        );
+        assert!(session.active_view().animation.sequence().is_empty());
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("reverse".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(session.active_view().animation.sequence(), &[2, 1, 0]);
+
+        session.views.activate(first);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("ping-pong".into()))
+        );
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[0, 1, 2, 3, 2, 1]
+        );
+        session.views.active_mut().unwrap().animation.step();
+        assert_eq!(
+            session.active_view().animation.index,
+            1,
+            "switching views must preserve the return leg"
+        );
+        session.views.activate(second);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("reverse".into()))
+        );
+        assert_eq!(session.active_view().animation.sequence(), &[2, 1, 0]);
+        assert_eq!(host.plugins().filter(|p| p.enabled).count(), 1);
+    }
+
+    #[test]
     fn view_info_layer_metadata() {
         use crate::cmd::Command;
         use crate::view::FileStatus;

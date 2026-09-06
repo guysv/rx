@@ -71,6 +71,9 @@ PLUGINS
     :set animation/mode = reverse
     :set animation/mode = ping-pong
 
+  Each view remembers its playback mode. Switching views updates the setting
+  to match, without restarting playback.
+
 TROUBLESHOOTING
 
   If something isn't working like it's supposed to, there are various things
