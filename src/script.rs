@@ -3798,7 +3798,7 @@ mod test {
     }
 
     #[test]
-    fn animation_mode_stock_plugin_sets_ping_pong_playback() {
+    fn animation_mode_setting_updates_playback_silently() {
         use crate::view::FileStatus;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3813,23 +3813,100 @@ mod test {
         let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
         host.load(&mut session);
         assert_eq!(host.plugins().filter(|plugin| plugin.enabled).count(), 1);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "{}",
+            session.message
+        );
+        assert!(session.active_view().animation.sequence().is_empty());
+        let message = session.message.to_string();
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("reverse".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[3, 2, 1, 0],
+            "{}; setting={:?}; enabled={}",
+            session.message,
+            session.settings.get("animation/mode"),
+            host.plugins().filter(|p| p.enabled).count()
+        );
+        assert_eq!(
+            session.message.to_string(),
+            message,
+            "mode changes must be silent"
+        );
+        session.views.active_mut().unwrap().animation.step();
+        let index = session.active_view().animation.index;
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.active_view().animation.index,
+            index,
+            "updates must not restart playback"
+        );
 
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert_eq!(
             session.active_view().animation.sequence(),
             &[0, 1, 2, 3, 2, 1]
         );
 
-        host.dispatch_command(&mut session, "animation-mode", "forward");
+        session.views.active_mut().unwrap().animation.set_frame(0);
+        for _ in 0..4 {
+            session.views.active_mut().unwrap().animation.step();
+        }
+        assert_eq!(session.active_view().animation.index, 2);
+        host.dispatch_update(&mut session);
+        session.views.active_mut().unwrap().animation.step();
+        assert_eq!(
+            session.active_view().animation.index,
+            1,
+            "updates must preserve the return leg of ping-pong"
+        );
+
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("invalid".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("ping-pong".into()))
+        );
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[0, 1, 2, 3, 2, 1]
+        );
+        let error = session.message.to_string();
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), error);
+
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("forward".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert!(session.active_view().animation.sequence().is_empty());
 
         session.command(crate::cmd::Command::FrameRemove);
         session.command(crate::cmd::Command::FrameRemove);
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert_eq!(session.active_view().animation.sequence(), &[0, 1]);
 
         session.command(crate::cmd::Command::FrameRemove);
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        host.dispatch_update(&mut session);
         assert_eq!(session.active_view().animation.sequence(), &[0]);
     }
 

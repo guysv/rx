@@ -67,9 +67,9 @@ PLUGINS
 
   The in-tree `animation-mode` plugin adds per-view playback orders:
 
-    :animation-mode forward
-    :animation-mode reverse
-    :animation-mode ping-pong
+    :set animation/mode = forward
+    :set animation/mode = reverse
+    :set animation/mode = ping-pong
 
 TROUBLESHOOTING
 
