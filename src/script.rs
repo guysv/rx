@@ -5959,6 +5959,166 @@ mod test {
     }
 
     #[test]
+    fn rotate_scale_preview_tracks_algorithm_without_painting() {
+        use crate::gfx::Rgba8;
+        use crate::session::{Mode, Selection};
+        let Some(gfx) = test_gfx() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/rotate-scale");
+        let dest = dir.path().join("rotate-scale");
+        std::fs::create_dir(&dest).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+            }
+        }
+        write_plugin(
+            dir.path(),
+            "external",
+            r#"
+            pub fn init(rx) { rx.export("render_pass", render_pass); #{} }
+            pub fn render_pass(state, rx, args) {
+                rx.call_plugin("rotate-scale", "cleanedge", args).unwrap();
+            }
+        "#,
+        );
+        let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 64, 64);
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            2,
+            "{}",
+            session.message
+        );
+        let mut pixels = vec![Rgba8::TRANSPARENT; 64 * 64];
+        for y in 20..43 {
+            for x in 24..(27 + (y - 20) / 2) {
+                pixels[y * 64 + x] = Rgba8::new(255, 255, 255, 255);
+            }
+        }
+        session
+            .views
+            .active_mut()
+            .unwrap()
+            .resource
+            .record_view_painted(pixels.clone());
+        session.selection = Some(Selection::new(18, 16, 47, 48));
+        host.dispatch_command(&mut session, "selection/rotate", "");
+        host.dispatch_command(&mut session, "rotate/set", "33");
+
+        // Command entry must return to this exact gesture, not start a new one.
+        let mut execution = crate::execution::Execution::Normal;
+        let colon: crate::event::TimedEvent = "00000 0000000 char/received ':'".parse().unwrap();
+        session.handle_event(colon.event, &mut execution, &mut host);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.mode, Mode::Command);
+        session.cmdline.puts("set rotate-scale/algo = cleanedge");
+        let enter: crate::event::TimedEvent = "00001 0000017 keyboard/input <return> pressed"
+            .parse()
+            .unwrap();
+        session.handle_event(enter.event, &mut execution, &mut host);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.mode.to_string(), "visual (rotation)");
+        assert!(session.selection.is_some());
+
+        let render = |host: &mut PluginHost, session: &mut Session| {
+            let layer = ScriptTexture::create(&gfx, 64, 64);
+            let staging = ScriptTexture::create(&gfx, 64, 64);
+            let mut targets = ViewTargets::new();
+            targets.insert(
+                u16::from(session.views.active_id),
+                ViewTarget {
+                    layer: layer
+                        .wgpu_texture()
+                        .create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(SCRIPT_TEXTURE_FORMAT),
+                            ..Default::default()
+                        }),
+                    staging: staging
+                        .wgpu_texture()
+                        .create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(SCRIPT_TEXTURE_FORMAT),
+                            ..Default::default()
+                        }),
+                    width: 64,
+                    height: 64,
+                },
+            );
+            let encoder = gfx.device.create_command_encoder(&Default::default());
+            let encoder = host.dispatch_shade(session, encoder, targets);
+            gfx.queue.submit(std::iter::once(encoder.finish()));
+            assert_eq!(
+                host.plugins().filter(|p| p.enabled).count(),
+                2,
+                "{}",
+                session.message
+            );
+            (layer.pixels(&gfx.device), staging.pixels(&gfx.device))
+        };
+        let mask = |pixels: &[u8]| pixels.chunks_exact(4).map(|p| p[3] > 0).collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for algo in [
+            "nearest",
+            "cleanedge",
+            "mmpx",
+            "rotsprite",
+            "external",
+            "cleanedge",
+        ] {
+            session
+                .settings
+                .set("rotate-scale/algo", crate::cmd::Value::Ident(algo.into()))
+                .unwrap();
+            let (layer, preview) = render(&mut host, &mut session);
+            assert!(
+                layer.iter().all(|&v| v == 0),
+                "{algo}: preview must not paint artwork"
+            );
+            assert!(
+                preview.iter().any(|&v| v != 0),
+                "{algo}: preview must be visible"
+            );
+            let (_, again) = render(&mut host, &mut session);
+            assert_eq!(
+                preview, again,
+                "{algo}: successive previews must not accumulate"
+            );
+            host.dispatch_command(&mut session, "rotate/apply", "");
+            let (committed, _) = render(&mut host, &mut session);
+            assert_eq!(
+                mask(&preview),
+                mask(&committed),
+                "{algo}: preview and commit silhouettes must agree"
+            );
+            results.push(mask(&preview));
+        }
+        assert!(
+            results[1..4].iter().any(|m| m != &results[0]),
+            "switching algorithms must change the preview"
+        );
+        assert_eq!(
+            results[1], results[4],
+            "external algorithms must also preview"
+        );
+        assert_eq!(
+            results[1], results[5],
+            "switching back must retain the source and transform"
+        );
+        session.switch_mode(Mode::Normal);
+        host.dispatch_update(&mut session);
+        let (_, staging) = render(&mut host, &mut session);
+        assert!(
+            staging.iter().all(|&v| v == 0),
+            "leaving the gesture must stop previewing"
+        );
+    }
+
+    #[test]
     fn rotate_scale_flow_smoke() {
         use crate::gfx::Rgba8;
         use crate::session::Mode;
