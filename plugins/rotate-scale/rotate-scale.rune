@@ -8,7 +8,8 @@
 // every frame; <return> (:rotate/apply) stamps it into the view as a
 // recorded, undoable edit; escape cancels. The `rotate-scale/algo`
 // setting selects nearest, cleanedge, mmpx, or rotsprite. Any other
-// non-empty value names an external interface plugin.
+// non-empty value names an external interface plugin. The selected algorithm
+// is used for both the live preview and the committed edit.
 //
 // State note: long-lived state avoids `Option` — Rune's `unwrap` takes
 // the inner value out of a shared Option, poisoning it for the next
@@ -48,9 +49,11 @@ pub fn init(rx) {
     rx.register_command_repeating("scale/add", ["float", "float"], "Add to selection scale", scale_add);
     rx.register_command("rotate/apply", [], "Stamp the transformed selection", apply);
 
-    // Default keys for the gesture modes. The command line is not
-    // reachable from script modes (only script-tier bindings fire), so
-    // the commands are bound here; users can re-bind via :map/script.
+    // Script modes need their own command-entry binding. Returning from
+    // command mode preserves the selection, pivot, and accumulated gesture.
+    rx.bind(ROTATION_MODE, "':' :mode command");
+    rx.bind(SCALE_MODE, "':' :mode command");
+    // Users can re-bind these defaults via :map/script.
     rx.bind(ROTATION_MODE, "<return> :rotate/apply");
     rx.bind(SCALE_MODE, "<return> :rotate/apply");
     rx.bind(ROTATION_MODE, "'e' :rotate/add 15");
@@ -78,6 +81,9 @@ pub fn init(rx) {
         drag_x: 0.0,
         drag_y: 0.0,
         clipboard: (),
+        preview: (),
+        preview_width: 0,
+        preview_height: 0,
         in_progress: false,
         pasted_once: false,
         apply_queued: false,
@@ -401,7 +407,7 @@ fn active_view(state, rx) {
 fn sprite_pass(rx, encoder, pipeline, label, transform, target, source, dst, ortho_w, ortho_h, clear) {
     let tbg = rx.create_transform_bind_group(ortho_w, ortho_h, transform).unwrap();
     let sbg = rx.create_texture_bind_group(source).unwrap();
-    let verts = rx.create_sprite_vertices(source, dst, rx::rgb(255, 255, 255), 1.0).unwrap();
+    let verts = rx.create_sprite_vertices(source, #{ dst }).unwrap();
     let load = if clear { "clear" } else { "load" };
     let pass = if target is i64 {
         encoder.begin_view_pass(label, target, "load").unwrap()
@@ -538,17 +544,39 @@ pub fn shade(state, rx, encoder) {
     let algo = rx.setting("rotate-scale/algo");
     let algo = if algo is String { algo } else { "" };
 
-    if algo != "" && algo != "nearest" && to_view {
-        let args = [encoder, transform, state.active_view_id, state.clipboard, dst, view.width, view.height];
+    let source = state.clipboard;
+    let sprite_transform = transform;
+    let sprite_dst = dst;
+    if algo != "" && algo != "nearest" {
+        // The render-pass interface accepts a view id or a script texture.
+        // Render previews to a reusable scratch texture, then composite it
+        // onto staging. This keeps external algorithms on the same contract
+        // and ensures that previewing never writes into the artwork.
+        let target = state.active_view_id;
+        if !to_view {
+            if state.preview_width != view.width || state.preview_height != view.height {
+                state.preview = rx.create_texture(view.width, view.height).unwrap();
+                state.preview_width = view.width;
+                state.preview_height = view.height;
+            }
+            encoder.begin_render_pass("rotate-preview-clear", state.preview, "clear").unwrap().end();
+            target = state.preview;
+        }
+        let args = [encoder, transform, target, state.clipboard, dst, view.width, view.height];
         if !builtin_render_pass(state, rx, algo, args) {
             rx.call_plugin(algo, "render_pass", args).unwrap();
         }
-        return;
+        if to_view {
+            return;
+        }
+        source = state.preview;
+        sprite_transform = rx::mat4_identity();
+        sprite_dst = rx::rect(0.0, 0.0, view.width as f64, view.height as f64);
     }
 
-    let tbg = rx.create_transform_bind_group(view.width, view.height, transform).unwrap();
-    let sbg = rx.create_texture_bind_group(state.clipboard).unwrap();
-    let verts = rx.create_sprite_vertices(state.clipboard, dst, rx::rgb(255, 255, 255), opacity).unwrap();
+    let tbg = rx.create_transform_bind_group(view.width, view.height, sprite_transform).unwrap();
+    let sbg = rx.create_texture_bind_group(source).unwrap();
+    let verts = rx.create_sprite_vertices(source, #{ dst: sprite_dst, opacity }).unwrap();
 
     let pass = if to_view {
         encoder.begin_view_pass("rotate-scale", state.active_view_id, "load").unwrap()

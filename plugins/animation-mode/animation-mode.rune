@@ -1,37 +1,13 @@
-// animation-mode: per-view playback orders for sprite strips.
-//
-// The host still owns the global animation clock and delay. This plugin only
-// selects the order in which the active view's frames are visited.
+// animation-mode: per-view playback orders, controlled by
+// :set animation/mode = forward | reverse | ping-pong.
+// The host owns the animation clock and delay; successful changes are silent.
 
 pub fn init(rx) {
-    rx.register_command(
-        "animation-mode",
-        ["str"],
-        "Set active-view playback: forward, reverse, or ping-pong",
-        animation_mode,
-    );
-    #{}
+    rx.declare_setting("animation/mode", "forward");
+    #{ last_mode: "forward", views: [] }
 }
 
-fn active_view(rx) {
-    let id = rx.active_view_id();
-    for view in rx.views() {
-        if view.id == id {
-            return Some(view);
-        }
-    }
-    None
-}
-
-fn animation_mode(state, rx, args) {
-    let view = active_view(rx);
-    if view.is_none() {
-        rx.message("No active view");
-        return;
-    }
-    let view = view.unwrap();
-    let mode = args[0].to_lowercase();
-
+fn apply(rx, view, mode) {
     if mode == "forward" {
         rx.clear_animation_sequence(view.id);
     } else if mode == "reverse" {
@@ -42,7 +18,7 @@ fn animation_mode(state, rx, args) {
             sequence.push(frame);
         }
         rx.set_animation_sequence(view.id, sequence);
-    } else if mode == "ping-pong" || mode == "pingpong" {
+    } else {
         let sequence = [];
         for frame in 0..view.frames {
             sequence.push(frame);
@@ -54,10 +30,47 @@ fn animation_mode(state, rx, args) {
             frame -= 1;
         }
         rx.set_animation_sequence(view.id, sequence);
-    } else {
-        rx.message(`Unknown animation mode '${mode}'; use forward, reverse, or ping-pong`);
+    }
+}
+
+pub fn update(state, rx) {
+    let requested = rx.setting("animation/mode").to_lowercase();
+    if requested == "pingpong" { requested = "ping-pong"; }
+    if requested != "forward" && requested != "reverse" && requested != "ping-pong" {
+        rx.set_setting("animation/mode", state.last_mode.clone());
+        rx.message("Invalid animation/mode; use forward, reverse, or ping-pong");
         return;
     }
 
-    rx.message(`Animation mode: ${mode}`);
+    for view in rx.views() {
+        if view.id != rx.active_view_id() { continue; }
+        let entry = ();
+        let found = false;
+        for saved in state.views {
+            if saved.id == view.id { entry = saved; found = true; }
+        }
+        if !found {
+            entry = #{ id: view.id, mode: "forward", frames: -1 };
+            state.views.push(entry);
+        }
+        // An explicit setting change applies to the active view. Otherwise,
+        // switching views restores that view's setting without changing it.
+        let mode = if requested != state.last_mode { requested } else { entry.mode };
+        if mode != entry.mode || view.frames != entry.frames {
+            apply(rx, view, mode);
+            entry.mode = mode;
+            entry.frames = view.frames;
+        }
+        rx.set_setting("animation/mode", entry.mode.clone());
+        state.last_mode = entry.mode;
+        return;
+    }
+}
+
+pub fn view_removed(state, rx, id) {
+    let remaining = [];
+    for entry in state.views {
+        if entry.id != id { remaining.push(entry); }
+    }
+    state.views = remaining;
 }

@@ -540,6 +540,61 @@ fn rect(x1: f64, y1: f64, x2: f64, y2: f64) -> Rect {
     Rect { x1, y1, x2, y2 }
 }
 
+/// Parsed sprite descriptor. Borrow fields so descriptors stored in plugin
+/// state can be reused across frames without consuming their native values.
+struct SpriteOptions {
+    src: Rect,
+    dst: Rect,
+    color: crate::gfx::color::Rgba8,
+    opacity: f64,
+}
+
+impl SpriteOptions {
+    fn parse(options: &rune::runtime::Object, width: u32, height: u32) -> Result<Self, String> {
+        for key in options.keys() {
+            if !matches!(key.as_str(), "src" | "dst" | "color" | "opacity") {
+                return Err(format!("unknown option `{}`", key));
+            }
+        }
+        let read_rect = |key: &str| -> Result<Option<Rect>, String> {
+            options
+                .get(key)
+                .map(|value| {
+                    value
+                        .borrow_ref::<Rect>()
+                        .map(|rect| *rect)
+                        .map_err(|_| format!("`{}` must be a Rect", key))
+                })
+                .transpose()
+        };
+        let dst = read_rect("dst")?.ok_or("missing required option `dst`")?;
+        let src = read_rect("src")?.unwrap_or(Rect {
+            x1: 0.0,
+            y1: 0.0,
+            x2: width as f64,
+            y2: height as f64,
+        });
+        let color = match options.get("color") {
+            Some(value) => *value
+                .borrow_ref::<crate::gfx::color::Rgba8>()
+                .map_err(|_| "`color` must be an Rgba8")?,
+            None => crate::gfx::color::Rgba8::WHITE,
+        };
+        let opacity = match options.get("opacity") {
+            Some(value) => {
+                rune::from_value::<f64>(value.clone()).map_err(|_| "`opacity` must be a float")?
+            }
+            None => 1.0,
+        };
+        Ok(Self {
+            src,
+            dst,
+            color,
+            opacity,
+        })
+    }
+}
+
 type SharedPass = std::sync::Arc<std::sync::Mutex<Option<wgpu::RenderPass<'static>>>>;
 type SharedComputePass = std::sync::Arc<std::sync::Mutex<Option<wgpu::ComputePass<'static>>>>;
 type SharedEncoder = std::sync::Arc<std::sync::Mutex<Option<wgpu::CommandEncoder>>>;
@@ -2293,37 +2348,30 @@ impl Ctx {
         })
     }
 
-    /// Build a vertex buffer for one textured quad mapping the whole of
-    /// `texture` onto `dst` (target pixels), tinted with `color` at
-    /// `opacity`. Six vertices.
+    /// Convenience helper for the existing render-pass API: allocate six
+    /// sprite-layout vertices, then bind/draw the returned buffer as usual.
+    /// `options` requires `dst`; `src` defaults to the whole texture,
+    /// `color` to white, and `opacity` to 1.0. Rectangles are y-up pixels.
     #[rune::function]
     fn create_sprite_vertices(
         &mut self,
         texture: &ScriptTexture,
-        dst: &Rect,
-        color: &crate::gfx::color::Rgba8,
-        opacity: f64,
+        options: &rune::runtime::Object,
     ) -> Option<ScriptBuffer> {
-        let src = Rect {
-            x1: 0.0,
-            y1: 0.0,
-            x2: texture.width as f64,
-            y2: texture.height as f64,
+        let options = match SpriteOptions::parse(options, texture.width, texture.height) {
+            Ok(options) => options,
+            Err(error) => {
+                self.error(format!("create_sprite_vertices: {}", error));
+                return None;
+            }
         };
-        self.sprite_vertices(texture, &src, dst, color, opacity)
-    }
-
-    /// Like `create_sprite_vertices`, but maps only the `src` rect of
-    /// the texture (in texture pixels) onto `dst` — white, full
-    /// a composited sheet.
-    #[rune::function]
-    fn create_sprite_vertices_src(
-        &mut self,
-        texture: &ScriptTexture,
-        src: &Rect,
-        dst: &Rect,
-    ) -> Option<ScriptBuffer> {
-        self.sprite_vertices(texture, src, dst, &crate::gfx::color::Rgba8::WHITE, 1.0)
+        self.sprite_vertices(
+            texture,
+            &options.src,
+            &options.dst,
+            &options.color,
+            options.opacity,
+        )
     }
 
     /// Export a function for other plugins to call via
@@ -2612,7 +2660,6 @@ fn module() -> Result<rune::Module, rune::ContextError> {
     m.function_meta(Ctx::create_transform_params_bind_group)?;
     m.function_meta(Ctx::create_texture_bind_group)?;
     m.function_meta(Ctx::create_sprite_vertices)?;
-    m.function_meta(Ctx::create_sprite_vertices_src)?;
     m.function_meta(rgb)?;
     m.function_meta(rgba)?;
     m.function_meta(rect)?;
@@ -3471,9 +3518,14 @@ impl PluginHost {
                         state, ctx, id
                     ))
                 }
-                _ => dispatch!(plugins, commands, gfx, session, "view_removed", |state, ctx| (
-                    state, ctx, id
-                )),
+                _ => dispatch!(
+                    plugins,
+                    commands,
+                    gfx,
+                    session,
+                    "view_removed",
+                    |state, ctx| (state, ctx, id)
+                ),
             }
         }
     }
@@ -3566,6 +3618,90 @@ impl ReloadWatcher {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn sprite_descriptor_defaults_validation_and_reuse() {
+        let engine = ScriptEngine::new().unwrap();
+        let descriptor = |expression: &str| {
+            engine
+                .compile_str("descriptor", &format!("pub fn make() {{ {} }}", expression))
+                .unwrap()
+                .call("make", ())
+                .unwrap()
+        };
+        let value = descriptor("#{ dst: rx::rect(1.0, 2.0, 5.0, 6.0) }");
+        let object = value.borrow_ref::<rune::runtime::Object>().unwrap();
+        let options = SpriteOptions::parse(&object, 16, 8).unwrap();
+        assert_eq!(
+            (
+                options.src.x1,
+                options.src.y1,
+                options.src.x2,
+                options.src.y2
+            ),
+            (0.0, 0.0, 16.0, 8.0)
+        );
+        assert_eq!(options.color, crate::gfx::color::Rgba8::WHITE);
+        assert_eq!(options.opacity, 1.0);
+        assert_eq!(
+            (
+                options.dst.x1,
+                options.dst.y1,
+                options.dst.x2,
+                options.dst.y2
+            ),
+            (1.0, 2.0, 5.0, 6.0)
+        );
+
+        let value = descriptor("#{ dst: rx::rect(1.0, 2.0, 5.0, 6.0), src: rx::rect(2.0, 3.0, 4.0, 5.0), color: rx::rgba(10, 20, 30, 40), opacity: 0.5 }");
+        let object = value.borrow_ref::<rune::runtime::Object>().unwrap();
+        for _ in 0..2 {
+            let options = SpriteOptions::parse(&object, 16, 8).unwrap();
+            assert_eq!(
+                (
+                    options.src.x1,
+                    options.src.y1,
+                    options.src.x2,
+                    options.src.y2
+                ),
+                (2.0, 3.0, 4.0, 5.0)
+            );
+            assert_eq!(
+                options.color,
+                crate::gfx::color::Rgba8 {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                    a: 40
+                }
+            );
+            assert_eq!(options.opacity, 0.5);
+        }
+        for (expression, message) in [
+            ("#{}", "missing required option `dst`"),
+            ("#{ dst: 1 }", "`dst` must be a Rect"),
+            (
+                "#{ dst: rx::rect(0.0, 0.0, 1.0, 1.0), src: false }",
+                "`src` must be a Rect",
+            ),
+            (
+                "#{ dst: rx::rect(0.0, 0.0, 1.0, 1.0), color: 1 }",
+                "`color` must be an Rgba8",
+            ),
+            (
+                "#{ dst: rx::rect(0.0, 0.0, 1.0, 1.0), opacity: false }",
+                "`opacity` must be a float",
+            ),
+            (
+                "#{ dst: rx::rect(0.0, 0.0, 1.0, 1.0), opactiy: 0.5 }",
+                "unknown option `opactiy`",
+            ),
+        ] {
+            let value = descriptor(expression);
+            let object = value.borrow_ref::<rune::runtime::Object>().unwrap();
+            assert_eq!(SpriteOptions::parse(&object, 16, 8).err().unwrap(), message);
+        }
+    }
 
     #[test]
     fn compile_and_call() {
@@ -3819,7 +3955,7 @@ mod test {
     }
 
     #[test]
-    fn animation_mode_stock_plugin_sets_ping_pong_playback() {
+    fn animation_mode_setting_updates_playback_silently() {
         use crate::view::FileStatus;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3834,24 +3970,178 @@ mod test {
         let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
         host.load(&mut session);
         assert_eq!(host.plugins().filter(|plugin| plugin.enabled).count(), 1);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            1,
+            "{}",
+            session.message
+        );
+        assert!(session.active_view().animation.sequence().is_empty());
+        let message = session.message.to_string();
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("reverse".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[3, 2, 1, 0],
+            "{}; setting={:?}; enabled={}",
+            session.message,
+            session.settings.get("animation/mode"),
+            host.plugins().filter(|p| p.enabled).count()
+        );
+        assert_eq!(
+            session.message.to_string(),
+            message,
+            "mode changes must be silent"
+        );
+        session.views.active_mut().unwrap().animation.step();
+        let index = session.active_view().animation.index;
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.active_view().animation.index,
+            index,
+            "updates must not restart playback"
+        );
 
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert_eq!(
             session.active_view().animation.sequence(),
             &[0, 1, 2, 3, 2, 1]
         );
 
-        host.dispatch_command(&mut session, "animation-mode", "forward");
+        session.views.active_mut().unwrap().animation.set_frame(0);
+        for _ in 0..4 {
+            session.views.active_mut().unwrap().animation.step();
+        }
+        assert_eq!(session.active_view().animation.index, 2);
+        host.dispatch_update(&mut session);
+        session.views.active_mut().unwrap().animation.step();
+        assert_eq!(
+            session.active_view().animation.index,
+            1,
+            "updates must preserve the return leg of ping-pong"
+        );
+
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("invalid".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("ping-pong".into()))
+        );
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[0, 1, 2, 3, 2, 1]
+        );
+        let error = session.message.to_string();
+        host.dispatch_update(&mut session);
+        assert_eq!(session.message.to_string(), error);
+
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("forward".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert!(session.active_view().animation.sequence().is_empty());
 
         session.command(crate::cmd::Command::FrameRemove);
         session.command(crate::cmd::Command::FrameRemove);
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
         assert_eq!(session.active_view().animation.sequence(), &[0, 1]);
 
         session.command(crate::cmd::Command::FrameRemove);
-        host.dispatch_command(&mut session, "animation-mode", "ping-pong");
+        host.dispatch_update(&mut session);
         assert_eq!(session.active_view().animation.sequence(), &[0]);
+    }
+
+    #[test]
+    fn animation_mode_remembers_each_view_without_restarting() {
+        use crate::view::FileStatus;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/animation-mode/animation-mode.rune"),
+            dir.path().join("animation-mode.rune"),
+        )
+        .unwrap();
+        let mut session = test_session().with_blank(
+            FileStatus::New(crate::view::FileStorage::Single("first.png".into())),
+            16,
+            16,
+        );
+        for _ in 0..3 {
+            session.command(crate::cmd::Command::FrameAdd);
+        }
+        let first = session.views.active_id;
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.load(&mut session);
+        host.dispatch_update(&mut session);
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("ping-pong".into()),
+        ));
+        host.dispatch_update(&mut session);
+        session.views.active_mut().unwrap().animation.set_frame(0);
+        for _ in 0..4 {
+            session.views.active_mut().unwrap().animation.step();
+        }
+
+        session.blank(FileStatus::NoFile, 16, 16);
+        for _ in 0..2 {
+            session.command(crate::cmd::Command::FrameAdd);
+        }
+        let second = session.views.active_id;
+        assert_ne!(first, second);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("forward".into()))
+        );
+        assert!(session.active_view().animation.sequence().is_empty());
+        session.command(crate::cmd::Command::Set(
+            "animation/mode".into(),
+            crate::cmd::Value::Ident("reverse".into()),
+        ));
+        host.dispatch_update(&mut session);
+        assert_eq!(session.active_view().animation.sequence(), &[2, 1, 0]);
+
+        session.views.activate(first);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("ping-pong".into()))
+        );
+        assert_eq!(
+            session.active_view().animation.sequence(),
+            &[0, 1, 2, 3, 2, 1]
+        );
+        session.views.active_mut().unwrap().animation.step();
+        assert_eq!(
+            session.active_view().animation.index,
+            1,
+            "switching views must preserve the return leg"
+        );
+        session.views.activate(second);
+        host.dispatch_update(&mut session);
+        assert_eq!(
+            session.settings.get("animation/mode"),
+            Some(&crate::cmd::Value::Ident("reverse".into()))
+        );
+        assert_eq!(session.active_view().animation.sequence(), &[2, 1, 0]);
+        assert_eq!(host.plugins().filter(|p| p.enabled).count(), 1);
     }
 
     #[test]
@@ -4941,12 +5231,9 @@ mod test {
                 let target = rx.create_texture(4, 4).unwrap();
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
                 let sbg = rx.create_texture_bind_group(source).unwrap();
-                let verts = rx.create_sprite_vertices(
-                    source,
-                    rx::rect(0.0, 0.0, 4.0, 4.0),
-                    rx::rgb(255, 255, 255),
-                    1.0,
-                ).unwrap();
+                let verts = rx.create_sprite_vertices(source, #{
+                    dst: rx::rect(0.0, 0.0, 4.0, 4.0),
+                }).unwrap();
                 #{ pipeline, target, tbg, sbg, verts }
             }
             pub fn shade(state, rx, encoder) {
@@ -5154,12 +5441,7 @@ mod test {
                 // Ortho normalizes, so 4x4 transforms and a (0,0,4,4)
                 // quad cover the full target whatever its pixel size.
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
-                let verts = rx.create_sprite_vertices(
-                    brush,
-                    rx::rect(0.0, 0.0, 4.0, 4.0),
-                    rx::rgb(255, 255, 255),
-                    1.0,
-                ).unwrap();
+                let verts = rx.create_sprite_vertices(brush, #{ dst: rx::rect(0.0, 0.0, 4.0, 4.0) }).unwrap();
                 #{ pipeline, brush, out, tbg, verts, frame: 0 }
             }
             pub fn shade(state, rx, encoder) {
@@ -5374,12 +5656,9 @@ mod test {
                     4, 4, rx::mat4_identity(),
                     [0.0, 1.0, 0.0, 1.0, 1.0],
                 ).unwrap();
-                let verts = rx.create_sprite_vertices(
-                    source,
-                    rx::rect(0.0, 0.0, 4.0, 4.0),
-                    rx::rgb(255, 255, 255),
-                    1.0,
-                ).unwrap();
+                let verts = rx.create_sprite_vertices(source, #{
+                    dst: rx::rect(0.0, 0.0, 4.0, 4.0),
+                }).unwrap();
                 #{ pipeline, target, tbg, verts }
             }
             pub fn shade(state, rx, encoder) {
@@ -5531,12 +5810,9 @@ mod test {
                 source.fill(rx::rgb(0, 0, 255));
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
                 let sbg = rx.create_texture_bind_group(source).unwrap();
-                let verts = rx.create_sprite_vertices(
-                    source,
-                    rx::rect(0.0, 0.0, 4.0, 4.0),
-                    rx::rgb(255, 255, 255),
-                    1.0,
-                ).unwrap();
+                let verts = rx.create_sprite_vertices(source, #{
+                    dst: rx::rect(0.0, 0.0, 4.0, 4.0),
+                }).unwrap();
                 #{ pipeline, tbg, sbg, verts, kept: None }
             }
             pub fn render(state, rx, pass) {
@@ -5646,12 +5922,9 @@ mod test {
                 source.fill(rx::rgb(0, 0, 255));
                 let tbg = rx.create_transform_bind_group(4, 4, rx::mat4_identity()).unwrap();
                 let sbg = rx.create_texture_bind_group(source).unwrap();
-                let verts = rx.create_sprite_vertices(
-                    source,
-                    rx::rect(0.0, 0.0, 4.0, 4.0),
-                    rx::rgb(255, 255, 255),
-                    1.0,
-                ).unwrap();
+                let verts = rx.create_sprite_vertices(source, #{
+                    dst: rx::rect(0.0, 0.0, 4.0, 4.0),
+                }).unwrap();
                 #{ pipeline, tbg, sbg, verts }
             }
             pub fn render(state, rx, pass) {
@@ -5778,7 +6051,8 @@ mod test {
         host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
         host.load(&mut session);
         assert!(
-            host.plugins().any(|p| p.name == "selection-outline" && p.enabled),
+            host.plugins()
+                .any(|p| p.name == "selection-outline" && p.enabled),
             "plugin must load: {}",
             session.message
         );
@@ -5862,7 +6136,8 @@ mod test {
         host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
         host.load(&mut session);
         assert!(
-            host.plugins().any(|p| p.name == "selection-outline" && p.enabled),
+            host.plugins()
+                .any(|p| p.name == "selection-outline" && p.enabled),
             "plugin must load: {}",
             session.message
         );
@@ -6197,6 +6472,166 @@ mod test {
     }
 
     #[test]
+    fn rotate_scale_preview_tracks_algorithm_without_painting() {
+        use crate::gfx::Rgba8;
+        use crate::session::{Mode, Selection};
+        let Some(gfx) = test_gfx() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/rotate-scale");
+        let dest = dir.path().join("rotate-scale");
+        std::fs::create_dir(&dest).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+            }
+        }
+        write_plugin(
+            dir.path(),
+            "external",
+            r#"
+            pub fn init(rx) { rx.export("render_pass", render_pass); #{} }
+            pub fn render_pass(state, rx, args) {
+                rx.call_plugin("rotate-scale", "cleanedge", args).unwrap();
+            }
+        "#,
+        );
+        let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 64, 64);
+        let mut host = PluginHost::new(Some(dir.path().to_path_buf())).unwrap();
+        host.attach_gfx(gfx.device.clone(), gfx.queue.clone());
+        host.load(&mut session);
+        assert_eq!(
+            host.plugins().filter(|p| p.enabled).count(),
+            2,
+            "{}",
+            session.message
+        );
+        let mut pixels = vec![Rgba8::TRANSPARENT; 64 * 64];
+        for y in 20..43 {
+            for x in 24..(27 + (y - 20) / 2) {
+                pixels[y * 64 + x] = Rgba8::new(255, 255, 255, 255);
+            }
+        }
+        session
+            .views
+            .active_mut()
+            .unwrap()
+            .resource
+            .record_view_painted(pixels.clone());
+        session.selection = Some(Selection::new(18, 16, 47, 48));
+        host.dispatch_command(&mut session, "selection/rotate", "");
+        host.dispatch_command(&mut session, "rotate/set", "33");
+
+        // Command entry must return to this exact gesture, not start a new one.
+        let mut execution = crate::execution::Execution::Normal;
+        let colon: crate::event::TimedEvent = "00000 0000000 char/received ':'".parse().unwrap();
+        session.handle_event(colon.event, &mut execution, &mut host);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.mode, Mode::Command);
+        session.cmdline.puts("set rotate-scale/algo = cleanedge");
+        let enter: crate::event::TimedEvent = "00001 0000017 keyboard/input <return> pressed"
+            .parse()
+            .unwrap();
+        session.handle_event(enter.event, &mut execution, &mut host);
+        host.dispatch_update(&mut session);
+        assert_eq!(session.mode.to_string(), "visual (rotation)");
+        assert!(session.selection.is_some());
+
+        let render = |host: &mut PluginHost, session: &mut Session| {
+            let layer = ScriptTexture::create(&gfx, 64, 64);
+            let staging = ScriptTexture::create(&gfx, 64, 64);
+            let mut targets = ViewTargets::new();
+            targets.insert(
+                u16::from(session.views.active_id),
+                ViewTarget {
+                    layer: layer
+                        .wgpu_texture()
+                        .create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(SCRIPT_TEXTURE_FORMAT),
+                            ..Default::default()
+                        }),
+                    staging: staging
+                        .wgpu_texture()
+                        .create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(SCRIPT_TEXTURE_FORMAT),
+                            ..Default::default()
+                        }),
+                    width: 64,
+                    height: 64,
+                },
+            );
+            let encoder = gfx.device.create_command_encoder(&Default::default());
+            let encoder = host.dispatch_shade(session, encoder, targets);
+            gfx.queue.submit(std::iter::once(encoder.finish()));
+            assert_eq!(
+                host.plugins().filter(|p| p.enabled).count(),
+                2,
+                "{}",
+                session.message
+            );
+            (layer.pixels(&gfx.device), staging.pixels(&gfx.device))
+        };
+        let mask = |pixels: &[u8]| pixels.chunks_exact(4).map(|p| p[3] > 0).collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for algo in [
+            "nearest",
+            "cleanedge",
+            "mmpx",
+            "rotsprite",
+            "external",
+            "cleanedge",
+        ] {
+            session
+                .settings
+                .set("rotate-scale/algo", crate::cmd::Value::Ident(algo.into()))
+                .unwrap();
+            let (layer, preview) = render(&mut host, &mut session);
+            assert!(
+                layer.iter().all(|&v| v == 0),
+                "{algo}: preview must not paint artwork"
+            );
+            assert!(
+                preview.iter().any(|&v| v != 0),
+                "{algo}: preview must be visible"
+            );
+            let (_, again) = render(&mut host, &mut session);
+            assert_eq!(
+                preview, again,
+                "{algo}: successive previews must not accumulate"
+            );
+            host.dispatch_command(&mut session, "rotate/apply", "");
+            let (committed, _) = render(&mut host, &mut session);
+            assert_eq!(
+                mask(&preview),
+                mask(&committed),
+                "{algo}: preview and commit silhouettes must agree"
+            );
+            results.push(mask(&preview));
+        }
+        assert!(
+            results[1..4].iter().any(|m| m != &results[0]),
+            "switching algorithms must change the preview"
+        );
+        assert_eq!(
+            results[1], results[4],
+            "external algorithms must also preview"
+        );
+        assert_eq!(
+            results[1], results[5],
+            "switching back must retain the source and transform"
+        );
+        session.switch_mode(Mode::Normal);
+        host.dispatch_update(&mut session);
+        let (_, staging) = render(&mut host, &mut session);
+        assert!(
+            staging.iter().all(|&v| v == 0),
+            "leaving the gesture must stop previewing"
+        );
+    }
+
+    #[test]
     fn rotate_scale_flow_smoke() {
         use crate::gfx::Rgba8;
         use crate::session::Mode;
@@ -6377,8 +6812,7 @@ mod test {
             std::fs::write(sub.join(name).with_extension("rune"), format!(
                 "{}\npub fn run(state, rx, args) {{ probe(state, rx, args); }}\n", body)).unwrap();
             let mut full = String::from(body);
-            full.push_str(&format!(
-                "\npub fn init2() {{}}\n"));
+            full.push_str(&format!("\npub fn init2() {{}}\n"));
             let mut session = test_session().with_blank(crate::view::FileStatus::NoFile, 32, 32);
             let mut host = PluginHost::new(Some(sub.clone())).unwrap();
             host.load(&mut session);
